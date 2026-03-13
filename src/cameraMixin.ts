@@ -111,13 +111,17 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
         this.console.error(message, ...args),
     };
 
-    this.init();
+    setTimeout(() => this.init(), 5000);
   }
 
   private async init() {
+    if (this.killed) return;
+
     this.console.log(`ONVIF Rebroadcast mixin initialized for ${this.name}`);
 
     await this.discoverStreams();
+
+    if (this.killed) return;
 
     if (this.storageSettings.values.serverEnabled) {
       await this.startOnvifServer();
