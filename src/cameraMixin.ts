@@ -46,6 +46,7 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
   };
   private onvifServer: OnvifServer | null = null;
   private discoveredStreams: RtspStreamInfo[] = [];
+  private assignedPort: number = 0;
   private killed = false;
   private motionListener: EventListenerRegister | null = null;
   private detectionListener: EventListenerRegister | null = null;
@@ -78,17 +79,6 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
       type: "boolean",
       defaultValue: false,
       immediate: true,
-    },
-    refreshStreams: {
-      title: "Refresh streams",
-      type: "button",
-      onPut: async () => {
-        await this.discoverStreams();
-        if (this.onvifServer?.isRunning) {
-          this.onvifServer.updateStreams(this.discoveredStreams);
-          this.console.log(`Streams updated for ${this.name}`);
-        }
-      },
     },
   });
 
@@ -129,7 +119,35 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
   }
 
   async getMixinSettings(): Promise<Setting[]> {
-    return this.storageSettings.getSettings();
+    const settings = await this.storageSettings.getSettings();
+
+    if (this.assignedPort && this.onvifServer?.isRunning) {
+      const localIp = getLocalIp();
+      const baseUrl = `http://${localIp}:${this.assignedPort}/onvif`;
+
+      settings.push({
+        key: 'deviceServiceUrl',
+        title: 'ONVIF Device Service Url',
+        description: `${baseUrl}/device_service`,
+        value: `${baseUrl}/device_service`,
+        type: 'string',
+        readonly: true,
+        subgroup: 'Service URLs',
+      });
+
+      settings.push({
+        key: 'mediaServiceUrl',
+        title: 'ONVIF Media Service Url',
+        description: `${baseUrl}/media_service`,
+        value: `${baseUrl}/media_service`,
+        type: 'string',
+        readonly: true,
+        subgroup: 'Service URLs',
+      });
+
+    }
+
+    return settings;
   }
 
   async putMixinSetting(key: string, value: SettingValue): Promise<void> {
@@ -188,11 +206,11 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
         });
       }
 
-      this.console.log(
+      this.logger.debug(
         `${this.name}: found ${this.discoveredStreams.length} RTSP rebroadcast stream(s)`,
       );
       for (const s of this.discoveredStreams) {
-        this.console.log(
+        this.logger.debug(
           `  - ${s.name}: ${s.rtspUrl} (${s.width ?? "?"}x${s.height ?? "?"})`,
         );
       }
@@ -211,7 +229,7 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
     const interfaces = device?.interfaces ?? this.mixinDeviceInterfaces;
     const has = (iface: ScryptedInterface) => interfaces.includes(iface);
 
-    this.console.log(`${this.name} interfaces: ${interfaces.join(", ")}`);
+    this.logger.debug(`${this.name} interfaces: ${interfaces.join(", ")}`);
 
     const capabilities: DeviceCapabilities = {
       hasPtz: has(ScryptedInterface.PanTiltZoom),
@@ -238,7 +256,7 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
       }
     }
 
-    this.console.log(
+    this.logger.debug(
       `${this.name} capabilities: PTZ=${capabilities.hasPtz}, Intercom=${capabilities.hasIntercom}, Motion=${capabilities.hasMotionSensor}, Audio=${capabilities.hasAudioSensor}, ObjectDetect=${capabilities.hasObjectDetection}`,
     );
 
@@ -254,7 +272,7 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
     await this.stopOnvifServer();
 
     if (this.discoveredStreams.length === 0) {
-      this.console.log(
+      this.logger.debug(
         `No streams discovered for ${this.name}, trying to discover...`,
       );
       await this.discoverStreams();
@@ -297,20 +315,20 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
     this.onvifServer = new OnvifServer(this.console, config);
 
     try {
-      const assignedPort = await this.onvifServer.start(port);
+      this.assignedPort = await this.onvifServer.start(port);
 
       // Save the assigned port to settings so it persists across restarts
-      if (assignedPort !== port) {
-        await this.storageSettings.putSetting("onvifPort", assignedPort);
+      if (this.assignedPort !== port) {
+        await this.storageSettings.putSetting("onvifPort", this.assignedPort);
         this.console.log(
-          `Saved assigned port ${assignedPort} to settings for ${this.name}`,
+          `Saved assigned port ${this.assignedPort} to settings for ${this.name}`,
         );
       }
 
       this.console.log(
-        `ONVIF device "${this.name}" available at http://${localIp}:${assignedPort}/onvif/device_service`,
+        `ONVIF device "${this.name}" available at http://${localIp}:${this.assignedPort}/onvif/device_service`,
       );
-      this.console.log(`Camera is now discoverable via ONVIF WS-Discovery`);
+      this.logger.debug(`Camera is now discoverable via ONVIF WS-Discovery`);
 
       this.startEventListeners(capabilities);
     } catch (e) {
@@ -342,7 +360,7 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
           });
         },
       );
-      this.console.log(`Motion event listener started for ${this.name}`);
+      this.logger.debug(`Motion event listener started for ${this.name}`);
     }
 
     if (capabilities.hasObjectDetection) {
@@ -370,7 +388,7 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
           }
         },
       );
-      this.console.log(
+      this.logger.debug(
         `Object detection event listener started for ${this.name}`,
       );
     }
