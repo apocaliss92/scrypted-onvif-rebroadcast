@@ -68,11 +68,15 @@ export default class OnvifRebroadcastPlugin
   ): Promise<any> {
     const existing = this.currentMixinsMap[mixinDeviceState.id];
     if (existing) {
-      this.console.log(`Releasing previous mixin for ${mixinDeviceState.name} before creating new one`);
+      this.console.log(
+        `Releasing previous mixin for ${mixinDeviceState.name} before creating new one`,
+      );
       try {
         await existing.release();
       } catch (e) {
-        this.console.warn(`Error releasing previous mixin: ${(e as Error).message}`);
+        this.console.warn(
+          `Error releasing previous mixin: ${(e as Error).message}`,
+        );
       }
     }
 
@@ -97,7 +101,7 @@ export default class OnvifRebroadcastPlugin
     try {
       await mixinDevice.release();
     } catch (e) {
-      this.console.warn(`Error releasing mixin ${id}: ${(e as Error).message}`);
+      // this.console.warn(`Error releasing mixin ${id}: ${(e as Error).message}`);
     }
   }
 }
