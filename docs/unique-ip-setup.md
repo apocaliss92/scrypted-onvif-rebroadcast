@@ -100,7 +100,7 @@ Each camera should show its assigned IP and MAC.
 
 Repeat for each camera IP. Each will be recognized as a separate device with its own unique MAC.
 
-> **Note:** The cameras will show as model "IPC-BO" or similar in UniFi — this is normal for third-party ONVIF cameras.
+> **Note:** UniFi will display the camera's actual model number (e.g. "Reolink CX410") as reported by the ONVIF device information.
 
 ## Step 5: Verify
 
