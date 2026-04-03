@@ -12,6 +12,7 @@ import {
 } from "@scrypted/sdk/settings-mixin";
 import { StorageSettings } from "@scrypted/sdk/storage-settings";
 import { OnvifServer } from "./onvifServer";
+import { IpAliasManager } from "./ipAlias";
 import {
   RtspStreamInfo,
   OnvifServiceConfig,
@@ -52,10 +53,16 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
   private detectionListener: EventListenerRegister | null = null;
 
   storageSettings = new StorageSettings(this, {
+    onvifIp: {
+      title: "ONVIF IP address",
+      description:
+        "Unique IP address for this camera's ONVIF server (e.g. a virtual IP alias). Required for NVRs like UniFi that identify cameras by IP. Leave empty to use the host's default IP.",
+      type: "string",
+    },
     onvifPort: {
       title: "ONVIF port",
       description:
-        "Port for this camera ONVIF server (leave empty for auto, each camera needs a unique port)",
+        "Port for this camera ONVIF server (defaults to 8000 when a custom IP is set, or auto-assigned otherwise)",
       type: "number",
     },
     serverEnabled: {
@@ -122,8 +129,8 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
     const settings = await this.storageSettings.getSettings();
 
     if (this.assignedPort && this.onvifServer?.isRunning) {
-      const localIp = getLocalIp();
-      const baseUrl = `http://${localIp}:${this.assignedPort}/onvif`;
+      const displayIp = (this.storageSettings.values.onvifIp as string) || getLocalIp();
+      const baseUrl = `http://${displayIp}:${this.assignedPort}/onvif`;
 
       settings.push({
         key: 'deviceServiceUrl',
@@ -285,8 +292,66 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
       return;
     }
 
-    const port = (this.storageSettings.values.onvifPort as number) || 0;
     const localIp = getLocalIp();
+    let onvifIp = (this.storageSettings.values.onvifIp as string) || undefined;
+
+    // Auto-assign IP from range if enabled and no manual IP is set
+    let proxyPort: number | undefined;
+    if (!onvifIp && this.plugin.storageSettings.values.autoIpEnabled) {
+      const baseIp = this.plugin.storageSettings.values.ipRangeStart as string;
+      if (baseIp) {
+        const iface =
+          (this.plugin.storageSettings.values.networkInterface as string) ||
+          "br0";
+        const prefix = (this.plugin.storageSettings.values.subnetPrefix as number) || 23;
+        const gateway = (this.plugin.storageSettings.values.gateway as string) || undefined;
+
+        const cameraIndex = this.plugin.getStableIpIndex(this.id);
+        const assignedIp = IpAliasManager.computeIp(baseIp, cameraIndex);
+
+        // Extract RTSP targets from discovered streams for proxying
+        const rtspTargets = this.discoveredStreams
+          .map((s) => {
+            try {
+              const url = new URL(s.rtspUrl);
+              return { host: url.hostname, port: parseInt(url.port) || 554 };
+            } catch { return null; }
+          })
+          .filter((t): t is { host: string; port: number } => t !== null);
+
+        const result = await this.plugin.ipAliasManager.addAlias(this.id, assignedIp, iface, prefix, gateway, rtspTargets);
+        if (result.ok && result.proxyPort) {
+          onvifIp = assignedIp;
+          proxyPort = result.proxyPort;
+
+          // Rewrite RTSP URLs to go through the proxy container
+          this.discoveredStreams.forEach((stream, idx) => {
+            try {
+              const url = new URL(stream.rtspUrl);
+              url.hostname = assignedIp;
+              url.port = String(554 + idx);
+              stream.rtspUrl = url.toString();
+              this.console.log(`Stream "${stream.name}" → ${stream.rtspUrl}`);
+            } catch {}
+          });
+
+          this.console.log(`Auto-assigned IP ${assignedIp} to ${this.name} (proxy port ${proxyPort})`);
+        } else {
+          this.console.warn(
+            `Failed to auto-assign IP ${assignedIp} for ${this.name}. Falling back to shared IP.`,
+          );
+        }
+      } else {
+        this.console.warn(
+          `Auto-assign IPs is enabled but no IP range start is configured.`,
+        );
+      }
+    }
+
+    // When using proxy containers, the ONVIF server listens on the proxy port
+    // on the container's main IP, and the proxy container forwards port 8000 to it.
+    // When not using proxies, use port 8000 if we have a unique IP, otherwise auto-assign.
+    const port = proxyPort || (onvifIp ? 8000 : ((this.storageSettings.values.onvifPort as number) || 0));
 
     const username = this.plugin.storageSettings.values.username as string;
     const password = this.plugin.storageSettings.values.password as string;
@@ -305,6 +370,8 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
       firmwareVersion: deviceInfo?.firmware || deviceInfo?.version || "1.0.0",
       serialNumber: deviceInfo?.serialNumber || `scrypted-${this.id}`,
       hostname: localIp,
+      onvifIp,
+      proxyMode: !!proxyPort,
       onvifPort: port,
       streams: this.discoveredStreams,
       username: username || undefined,
@@ -325,8 +392,9 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
         );
       }
 
+      const displayIp = onvifIp || localIp;
       this.console.log(
-        `ONVIF device "${this.name}" available at http://${localIp}:${this.assignedPort}/onvif/device_service`,
+        `ONVIF device "${this.name}" available at http://${displayIp}:${proxyPort ? 8000 : this.assignedPort}/onvif/device_service`,
       );
       this.logger.debug(`Camera is now discoverable via ONVIF WS-Discovery`);
 
@@ -407,6 +475,8 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
       await this.onvifServer.stop();
       this.onvifServer = null;
     }
+    // Clean up auto-assigned IP alias
+    await this.plugin.ipAliasManager.removeAlias(this.id);
   }
 
   async release() {

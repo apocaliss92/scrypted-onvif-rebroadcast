@@ -33,6 +33,9 @@ export interface OnvifServiceConfig {
     firmwareVersion: string;
     serialNumber: string;
     hostname: string;
+    onvifIp?: string;
+    /** When true, onvifIp is only used in SOAP responses, not for server binding */
+    proxyMode?: boolean;
     onvifPort: number;
     streams: RtspStreamInfo[];
     username?: string;
