@@ -89,10 +89,18 @@ Each camera should show its assigned IP and MAC.
 
 ## Step 4: Add Cameras in UniFi Protect
 
-1. In UniFi Protect: **Settings → Cameras → Add Camera → ONVIF**
-2. Enter each camera's assigned IP with port **8000**
-3. Enter the ONVIF username and password (configured in the plugin's Authentication settings)
-4. Each camera will be recognized as a separate device
+1. Open **UniFi Protect**
+2. Go to the **Devices** list view
+3. Click the **?** icon (help/question mark) next to the view toggle buttons
+4. Click **"Can't Find Your Device?"**
+5. Enter each camera's assigned IP with port **8000** (e.g. `192.168.1.240`)
+6. Enter the ONVIF username and password (configured in the plugin's Authentication settings)
+7. The camera will appear in the device list as a third-party camera (shown with the ONVIF icon)
+8. Click **"Click to Adopt"** to add it
+
+Repeat for each camera IP. Each will be recognized as a separate device with its own unique MAC.
+
+> **Note:** The cameras will show as model "IPC-BO" or similar in UniFi — this is normal for third-party ONVIF cameras.
 
 ## Step 5: Verify
 
