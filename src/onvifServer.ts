@@ -38,6 +38,7 @@ const MAX_EVENTS_PER_SUBSCRIPTION = 200;
 export class OnvifServer {
   private server: http.Server | null = null;
   private discoverySocket: dgram.Socket | null = null;
+  private responseSocket: dgram.Socket | null = null;
   private console: Console;
   private config: OnvifServiceConfig;
   private deviceUuid: string;
@@ -109,6 +110,19 @@ export class OnvifServer {
     return await this.tryListen(0);
   }
 
+  /**
+   * The effective IP address to use in all service URLs and discovery responses.
+   * When onvifIp is set, this camera appears as a unique device on that IP.
+   */
+  private get serviceIp(): string {
+    return this.config.onvifIp || this.config.hostname;
+  }
+
+  /** The port that external clients see (8000 in proxy mode, actual port otherwise) */
+  private get servicePort(): number {
+    return this.config.proxyMode ? 8000 : this.assignedPort;
+  }
+
   private tryListen(port: number): Promise<number> {
     return new Promise((resolve, reject) => {
       const server = http.createServer((req, res) => {
@@ -120,7 +134,11 @@ export class OnvifServer {
         reject(err);
       });
 
-      server.listen(port, () => {
+      // Bind to the specific onvifIp if set, otherwise all interfaces
+      // In proxy mode, bind to all interfaces (proxy container forwards to us).
+      // Otherwise bind to the specific IP if set.
+      const bindHost = this.config.proxyMode ? undefined : (this.config.onvifIp || undefined);
+      server.listen(port, bindHost, () => {
         this.server = server;
         const addr = server.address() as any;
         this.assignedPort = addr?.port ?? port;
@@ -318,12 +336,12 @@ export class OnvifServer {
       <tds:Model>${this.escXml(this.config.model)}</tds:Model>
       <tds:FirmwareVersion>${this.escXml(this.config.firmwareVersion)}</tds:FirmwareVersion>
       <tds:SerialNumber>${this.escXml(this.config.serialNumber)}</tds:SerialNumber>
-      <tds:HardwareId>Scrypted</tds:HardwareId>
+      <tds:HardwareId>${this.escXml(this.config.serialNumber)}</tds:HardwareId>
     </tds:GetDeviceInformationResponse>`);
   }
 
   private getCapabilities(): string {
-    const serviceUrl = `http://${this.config.hostname}:${this.assignedPort}/onvif`;
+    const serviceUrl = `http://${this.serviceIp}:${this.servicePort}/onvif`;
     const caps = this.config.capabilities;
 
     let ptzCapXml = "";
@@ -367,7 +385,7 @@ export class OnvifServer {
   }
 
   private getServices(): string {
-    const serviceUrl = `http://${this.config.hostname}:${this.assignedPort}/onvif`;
+    const serviceUrl = `http://${this.serviceIp}:${this.servicePort}/onvif`;
     const caps = this.config.capabilities;
 
     let services = `
@@ -488,12 +506,43 @@ export class OnvifServer {
   }
 
   private getNetworkInterfaces(): string {
+    // Generate a deterministic unique MAC per camera so NVRs like UniFi
+    // identify each camera as a separate physical device.
+    const mac = this.generateMac();
+
     return soapEnvelope(`
     <tds:GetNetworkInterfacesResponse>
       <tds:NetworkInterfaces token="eth0">
         <tt:Enabled>true</tt:Enabled>
+        <tt:Info>
+          <tt:Name>eth0</tt:Name>
+          <tt:HwAddress>${mac}</tt:HwAddress>
+        </tt:Info>
+        <tt:IPv4>
+          <tt:Enabled>true</tt:Enabled>
+          <tt:Config>
+            <tt:Manual>
+              <tt:Address>${this.serviceIp}</tt:Address>
+              <tt:PrefixLength>24</tt:PrefixLength>
+            </tt:Manual>
+            <tt:DHCP>false</tt:DHCP>
+          </tt:Config>
+        </tt:IPv4>
       </tds:NetworkInterfaces>
     </tds:GetNetworkInterfacesResponse>`);
+  }
+
+  /**
+   * Generate a deterministic MAC address from the device ID.
+   * Uses 02:xx:xx:xx:xx:xx range (locally administered, unicast).
+   */
+  private generateMac(): string {
+    const hash = crypto
+      .createHash("md5")
+      .update(`onvif-mac-${this.config.deviceId}`)
+      .digest();
+    const bytes = [0x02, hash[0], hash[1], hash[2], hash[3], hash[4]];
+    return bytes.map((b) => b.toString(16).padStart(2, "0")).join(":");
   }
 
   // ─── Media Service ───────────────────────────────────────────────
@@ -1016,7 +1065,7 @@ export class OnvifServer {
       `PullPoint subscription created: ${subId} for ${this.config.deviceName}`,
     );
 
-    const serviceUrl = `http://${this.config.hostname}:${this.assignedPort}/onvif/event_service`;
+    const serviceUrl = `http://${this.serviceIp}:${this.servicePort}/onvif/event_service`;
 
     return soapEnvelope(`
     <tev:CreatePullPointSubscriptionResponse>
@@ -1128,6 +1177,7 @@ export class OnvifServer {
 
   private startDiscovery() {
     try {
+      // Listener socket: receives multicast probes on 0.0.0.0:3702
       this.discoverySocket = dgram.createSocket({
         type: "udp4",
         reuseAddr: true,
@@ -1145,7 +1195,6 @@ export class OnvifServer {
           message.includes("Probe") &&
           message.includes("NetworkVideoTransmitter")
         ) {
-          // Extract MessageID from the probe to echo in RelatesTo
           const messageIdMatch = message.match(
             /<[^>]*MessageID[^>]*>([^<]+)<\//,
           );
@@ -1164,6 +1213,26 @@ export class OnvifServer {
           );
         }
       });
+
+      // Response socket: bound to this camera's unique IP so ProbeMatch
+      // packets have the correct source address. NVRs like UniFi identify
+      // cameras by the source IP of the UDP response, not the XML content.
+      if (this.config.onvifIp && !this.config.proxyMode) {
+        this.responseSocket = dgram.createSocket({
+          type: "udp4",
+          reuseAddr: true,
+        });
+        this.responseSocket.on("error", (err) => {
+          this.console.warn(
+            `Response socket error for ${this.config.deviceName}: ${err.message}`,
+          );
+        });
+        this.responseSocket.bind(0, this.config.onvifIp, () => {
+          this.console.log(
+            `WS-Discovery response socket bound to ${this.config.onvifIp} for ${this.config.deviceName}`,
+          );
+        });
+      }
     } catch (e) {
       this.console.warn(
         `Failed to start WS-Discovery for ${this.config.deviceName}: ${(e as Error).message}`,
@@ -1184,6 +1253,14 @@ export class OnvifServer {
         /* ignore */
       }
       this.discoverySocket = null;
+    }
+    if (this.responseSocket) {
+      try {
+        this.responseSocket.close();
+      } catch {
+        /* ignore */
+      }
+      this.responseSocket = null;
     }
   }
 
@@ -1209,7 +1286,9 @@ export class OnvifServer {
 </s:Envelope>`;
 
     const buf = Buffer.from(bye);
-    this.discoverySocket.send(
+    // Send from camera-specific IP if available, otherwise use discovery socket
+    const sock = this.responseSocket || this.discoverySocket;
+    sock!.send(
       buf,
       0,
       buf.length,
@@ -1224,7 +1303,7 @@ export class OnvifServer {
   }
 
   private sendProbeMatch(rinfo: dgram.RemoteInfo, probeMessageId: string) {
-    const serviceUrl = `http://${this.config.hostname}:${this.assignedPort}/onvif/device_service`;
+    const serviceUrl = `http://${this.serviceIp}:${this.servicePort}/onvif/device_service`;
     const name = encodeURIComponent(this.config.deviceName);
 
     const scopes = [
@@ -1271,7 +1350,9 @@ export class OnvifServer {
 </s:Envelope>`;
 
     const buf = Buffer.from(response);
-    this.discoverySocket?.send(
+    // Send from camera-specific IP so the NVR sees the correct source address
+    const sock = this.responseSocket || this.discoverySocket;
+    sock?.send(
       buf,
       0,
       buf.length,
@@ -1281,7 +1362,7 @@ export class OnvifServer {
         if (err) {
           this.console.warn(`Failed to send ProbeMatch: ${err.message}`);
         } else {
-          // this.console.debug(`Sent ProbeMatch to ${rinfo.address}:${rinfo.port} for ${this.config.deviceName}`);
+          this.console.log(`Sent ProbeMatch from ${this.serviceIp} to ${rinfo.address}:${rinfo.port} for ${this.config.deviceName}`);
         }
       },
     );
