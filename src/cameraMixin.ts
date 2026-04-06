@@ -307,7 +307,7 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
         const gateway = (this.plugin.storageSettings.values.gateway as string) || undefined;
 
         const cameraIndex = this.plugin.getStableIpIndex(this.id);
-        const assignedIp = IpAliasManager.computeIp(baseIp, cameraIndex);
+        const assignedIp = IpAliasManager.computeIp(baseIp, cameraIndex, prefix);
 
         // Extract RTSP targets from discovered streams for proxying
         const rtspTargets = this.discoveredStreams

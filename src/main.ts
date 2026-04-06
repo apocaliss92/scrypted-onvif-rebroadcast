@@ -172,4 +172,21 @@ export default class OnvifRebroadcastPlugin
       // this.console.warn(`Error releasing mixin ${id}: ${(e as Error).message}`);
     }
   }
+
+  /**
+   * Called when the plugin is being shut down.
+   * Cleans up all proxy containers to prevent orphaned containers.
+   */
+  async release(): Promise<void> {
+    this.console.log("Plugin shutting down — cleaning up proxy containers...");
+    for (const [id, mixin] of Object.entries(this.currentMixinsMap)) {
+      try {
+        await mixin.release();
+      } catch (e) {
+        this.console.warn(`Error releasing mixin ${id}: ${(e as Error).message}`);
+      }
+    }
+    this.currentMixinsMap = {};
+    await this.ipAliasManager.removeAll();
+  }
 }

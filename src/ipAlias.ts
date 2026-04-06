@@ -1,10 +1,44 @@
-import { exec } from "child_process";
 import http from "http";
 import os from "os";
 import crypto from "crypto";
 import fs from "fs";
 
 const DOCKER_SOCKET = "/var/run/docker.sock";
+const DOCKER_API_TIMEOUT_MS = 30000;
+
+interface DockerNetwork {
+  Id: string;
+  Name: string;
+  Driver: string;
+}
+
+interface DockerImage {
+  RepoTags?: string[];
+}
+
+interface DockerContainerState {
+  Running: boolean;
+  ExitCode: number;
+}
+
+interface DockerContainerNetworkSettings {
+  IPAddress?: string;
+  MacAddress?: string;
+}
+
+interface DockerContainerInfo {
+  Id?: string;
+  State?: DockerContainerState;
+  NetworkSettings?: {
+    Networks?: Record<string, DockerContainerNetworkSettings>;
+  };
+}
+
+interface DockerCreateResponse {
+  Id?: string;
+  id?: string;
+  message?: string;
+}
 
 export class IpAliasManager {
   private console: Console;
@@ -12,19 +46,10 @@ export class IpAliasManager {
   private dockerAvailable: boolean | null = null;
   private networkCreated = false;
   private nextProxyPort = 18000;
+  private initLock: Promise<void> | null = null;
 
   constructor(console: Console) {
     this.console = console;
-  }
-
-  detectInterface(): string | null {
-    const interfaces = os.networkInterfaces();
-    for (const [name, addrs] of Object.entries(interfaces)) {
-      for (const addr of addrs ?? []) {
-        if (addr.family === "IPv4" && !addr.internal) return name;
-      }
-    }
-    return null;
   }
 
   static generateMac(deviceId: string): string {
@@ -33,7 +58,7 @@ export class IpAliasManager {
     return bytes.map((b) => b.toString(16).padStart(2, "0")).join(":");
   }
 
-  static computeIp(baseIp: string, index: number): string {
+  static computeIp(baseIp: string, index: number, prefixLength?: number): string {
     const parts = baseIp.split(".").map(Number);
     let carry = index;
     for (let i = 3; i >= 0; i--) {
@@ -41,7 +66,29 @@ export class IpAliasManager {
       carry = Math.floor(parts[i] / 256);
       parts[i] = parts[i] % 256;
     }
+
+    // Validate the computed IP is within the same subnet as the base IP
+    if (prefixLength !== undefined) {
+      const baseParts = baseIp.split(".").map(Number);
+      const baseNum = ((baseParts[0] << 24) | (baseParts[1] << 16) | (baseParts[2] << 8) | baseParts[3]) >>> 0;
+      const resultNum = ((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0;
+      const mask = (~0 << (32 - prefixLength)) >>> 0;
+      if ((baseNum & mask) !== (resultNum & mask)) {
+        throw new Error(
+          `Computed IP ${parts.join(".")} (index ${index}) is outside the /${prefixLength} subnet of ${baseIp}`
+        );
+      }
+    }
+
     return parts.join(".");
+  }
+
+  /**
+   * Sanitize a string for use as a Docker container name.
+   * Docker allows [a-zA-Z0-9_.-] only.
+   */
+  private static sanitizeContainerName(name: string): string {
+    return name.replace(/[^a-zA-Z0-9_.-]/g, "_");
   }
 
   private hasDockerSocket(): boolean {
@@ -58,7 +105,7 @@ export class IpAliasManager {
    */
   getContainerIp(): string {
     const interfaces = os.networkInterfaces();
-    for (const [name, addrs] of Object.entries(interfaces)) {
+    for (const [, addrs] of Object.entries(interfaces)) {
       for (const addr of addrs ?? []) {
         if (addr.family === "IPv4" && !addr.internal) return addr.address;
       }
@@ -78,6 +125,24 @@ export class IpAliasManager {
   private static readonly NETWORK_NAME = "onvif_cameras";
 
   /**
+   * Serialize access to shared Docker initialization (network + image).
+   * Prevents race conditions when multiple cameras initialize simultaneously.
+   */
+  private async withInitLock<T>(fn: () => Promise<T>): Promise<T> {
+    while (this.initLock) {
+      await this.initLock;
+    }
+    let resolve: () => void;
+    this.initLock = new Promise<void>((r) => (resolve = r));
+    try {
+      return await fn();
+    } finally {
+      this.initLock = null;
+      resolve!();
+    }
+  }
+
+  /**
    * Create a dedicated macvlan Docker network on br0 for ONVIF proxy containers.
    * This is separate from the Scrypted container's ipvlan network (br0.2),
    * giving each proxy container a unique MAC address.
@@ -85,12 +150,12 @@ export class IpAliasManager {
   private async ensureMacvlanNetwork(parentIface: string, subnet: string, gateway: string): Promise<boolean> {
     if (this.macvlanNetworkName) return true;
 
-    const networks: any[] = await this.dockerApiGet("/networks") || [];
-    const netSummary = networks.map((n: any) => `${n.Name}(${n.Driver})`).join(", ");
+    const networks = (await this.dockerApiGet<DockerNetwork[]>("/networks")) || [];
+    const netSummary = networks.map((n) => `${n.Name}(${n.Driver})`).join(", ");
     this.console.log(`Available Docker networks: ${netSummary}`);
 
     // Check if our dedicated network already exists
-    const existing = networks.find((n: any) => n.Name === IpAliasManager.NETWORK_NAME);
+    const existing = networks.find((n) => n.Name === IpAliasManager.NETWORK_NAME);
     if (existing) {
       this.macvlanNetworkName = IpAliasManager.NETWORK_NAME;
       this.console.log(`Using existing ${IpAliasManager.NETWORK_NAME} network (${existing.Driver})`);
@@ -99,7 +164,7 @@ export class IpAliasManager {
 
     // Create a new macvlan network on the specified parent interface
     this.console.log(`Creating macvlan network '${IpAliasManager.NETWORK_NAME}' on ${parentIface} (${subnet})...`);
-    const result = await this.dockerApiPost("/networks/create", {
+    const result = await this.dockerApiPost<DockerCreateResponse>("/networks/create", {
       Name: IpAliasManager.NETWORK_NAME,
       Driver: "macvlan",
       Options: { parent: parentIface },
@@ -144,32 +209,42 @@ export class IpAliasManager {
     }
 
     const mac = IpAliasManager.generateMac(deviceId);
-    const containerName = `onvif-proxy-${deviceId}`;
+    const containerName = IpAliasManager.sanitizeContainerName(`onvif-proxy-${deviceId}`);
 
     // Already managed
     const existing = this.activeProxies.get(deviceId);
     if (existing?.ip === ip) {
       // Check if proxy container is still running
       try {
-        const info = await this.dockerApiGet(`/containers/${containerName}/json`);
+        const info = await this.dockerApiGet<DockerContainerInfo>(`/containers/${containerName}/json`);
         if (info?.State?.Running) {
           return { ok: true, proxyPort: existing.proxyPort };
         }
-      } catch {}
+      } catch (e: unknown) {
+        this.console.debug?.(`Could not inspect existing container ${containerName}: ${(e as Error).message}`);
+      }
     }
 
-    // Compute network details from the assigned IP
-    const ipParts = ip.split(".").map(Number);
-    // Apply subnet mask to get network address
-    const ipNum = (ipParts[0] << 24) | (ipParts[1] << 16) | (ipParts[2] << 8) | ipParts[3];
-    const mask = (~0 << (32 - prefix)) >>> 0;
-    const netNum = (ipNum & mask) >>> 0;
-    const subnet = `${(netNum >>> 24) & 0xff}.${(netNum >>> 16) & 0xff}.${(netNum >>> 8) & 0xff}.${netNum & 0xff}/${prefix}`;
-    const gateway = gatewayOverride || `${ipParts[0]}.${ipParts[1]}.${ipParts[2]}.1`;
+    // Serialize network/image initialization to prevent race conditions
+    const initOk = await this.withInitLock(async () => {
+      // Compute network details from the assigned IP
+      const ipParts = ip.split(".").map(Number);
+      const ipNum = (ipParts[0] << 24) | (ipParts[1] << 16) | (ipParts[2] << 8) | ipParts[3];
+      const mask = (~0 << (32 - prefix)) >>> 0;
+      const netNum = (ipNum & mask) >>> 0;
+      const subnet = `${(netNum >>> 24) & 0xff}.${(netNum >>> 16) & 0xff}.${(netNum >>> 8) & 0xff}.${netNum & 0xff}/${prefix}`;
+      const gateway = gatewayOverride || `${ipParts[0]}.${ipParts[1]}.${ipParts[2]}.1`;
 
-    // Ensure macvlan network exists on the specified parent interface
-    const netOk = await this.ensureMacvlanNetwork(parentIface, subnet, gateway);
-    if (!netOk) return { ok: false };
+      // Ensure macvlan network exists on the specified parent interface
+      const netOk = await this.ensureMacvlanNetwork(parentIface, subnet, gateway);
+      if (!netOk) return false;
+
+      // Ensure socat image is available
+      await this.ensureSocatImage();
+      return true;
+    });
+
+    if (!initOk) return { ok: false };
 
     // Allocate a unique internal port for the ONVIF server
     const proxyPort = this.allocateProxyPort();
@@ -177,9 +252,6 @@ export class IpAliasManager {
 
     // Remove existing proxy container if any
     await this.removeProxyContainer(containerName);
-
-    // Ensure socat image is available (alpine + socat)
-    await this.ensureSocatImage();
 
     // Build socat command: always proxy ONVIF (8000), optionally proxy RTSP (554+)
     let cmd: string[];
@@ -200,7 +272,7 @@ export class IpAliasManager {
     }
 
     // Create proxy container on our dedicated macvlan network with unique MAC
-    const containerConfig: any = {
+    const containerConfig = {
       Image: "alpine/socat:latest",
       Entrypoint: entrypoint,
       Cmd: cmd,
@@ -218,7 +290,7 @@ export class IpAliasManager {
       },
     };
 
-    const createResult = await this.dockerApiPost(
+    const createResult = await this.dockerApiPost<DockerCreateResponse>(
       `/containers/create?name=${containerName}`,
       containerConfig,
     );
@@ -229,7 +301,7 @@ export class IpAliasManager {
     }
 
     // Start the container
-    const startResult = await this.dockerApiPost(`/containers/${createResult.Id}/start`, {});
+    const startResult = await this.dockerApiPost<DockerCreateResponse>(`/containers/${createResult.Id}/start`, {});
     if (startResult?.message) {
       this.console.error(`Failed to start proxy container for ${ip}: ${startResult.message}`);
       await this.removeProxyContainer(containerName);
@@ -239,7 +311,7 @@ export class IpAliasManager {
     // Wait a moment then verify it's running
     await new Promise((r) => setTimeout(r, 2000));
     try {
-      const info = await this.dockerApiGet(`/containers/${containerName}/json`);
+      const info = await this.dockerApiGet<DockerContainerInfo>(`/containers/${containerName}/json`);
       if (info?.State?.Running) {
         const actualIp = info?.NetworkSettings?.Networks?.[this.macvlanNetworkName!]?.IPAddress || ip;
         const actualMac = info?.NetworkSettings?.Networks?.[this.macvlanNetworkName!]?.MacAddress || mac;
@@ -251,8 +323,8 @@ export class IpAliasManager {
       }
       const exitCode = info?.State?.ExitCode;
       this.console.error(`Proxy container exited with code ${exitCode}. State: ${JSON.stringify(info?.State)}`);
-    } catch (e: any) {
-      this.console.error(`Failed to inspect proxy container: ${e.message}`);
+    } catch (e: unknown) {
+      this.console.error(`Failed to inspect proxy container: ${(e as Error).message}`);
     }
 
     await this.removeProxyContainer(containerName);
@@ -265,15 +337,17 @@ export class IpAliasManager {
   private async ensureSocatImage(): Promise<void> {
     // Check if image exists
     try {
-      const images: any[] = await this.dockerApiGet("/images/json");
-      const hasImage = images?.some?.((img: any) =>
-        img.RepoTags?.some?.((t: string) => t.includes("socat"))
+      const images = await this.dockerApiGet<DockerImage[]>("/images/json");
+      const hasImage = images?.some?.((img) =>
+        img.RepoTags?.some?.((t) => t.includes("socat"))
       );
       if (hasImage) return;
-    } catch {}
+    } catch (e: unknown) {
+      this.console.debug?.(`Could not check Docker images: ${(e as Error).message}`);
+    }
 
     // Pull the image (streaming response — need to consume the full stream)
-    this.console.log("Pulling alpine/socat image...");
+    this.console.log("Pulling alpine/socat image (requires internet access)...");
     await new Promise<void>((resolve, reject) => {
       const req = http.request(
         {
@@ -284,30 +358,49 @@ export class IpAliasManager {
         (res) => {
           res.on("data", () => {}); // consume stream
           res.on("end", () => {
-            this.console.log("Image pull complete");
+            if (res.statusCode && res.statusCode >= 400) {
+              this.console.error(
+                `Failed to pull alpine/socat (HTTP ${res.statusCode}). ` +
+                `In air-gapped environments, pre-pull the image: docker pull alpine/socat`
+              );
+            } else {
+              this.console.log("Image pull complete");
+            }
             resolve();
           });
         },
       );
-      req.on("error", reject);
+      req.on("error", (e) => {
+        this.console.error(
+          `Failed to pull alpine/socat: ${e.message}. ` +
+          `In air-gapped environments, pre-pull the image: docker pull alpine/socat`
+        );
+        reject(e);
+      });
       req.setTimeout(120000, () => reject(new Error("Image pull timeout")));
       req.end();
     });
   }
 
   /**
-   * Remove a proxy container.
+   * Remove a proxy container. Waits for stop to complete before deleting.
    */
   private async removeProxyContainer(name: string): Promise<void> {
+    // Stop the container first and wait for it to complete
     try {
-      await this.dockerApiPost(`/containers/${name}/stop`, {});
-    } catch {}
+      await this.dockerApiPost(`/containers/${name}/stop?t=5`, {});
+    } catch {
+      // Container may not exist or already stopped
+    }
+
+    // Now delete it
     await new Promise<void>((resolve) => {
       const req = http.request(
         { socketPath: DOCKER_SOCKET, path: `/containers/${name}?force=true`, method: "DELETE" },
         (res) => { res.resume(); res.on("end", () => resolve()); },
       );
       req.on("error", () => resolve());
+      req.setTimeout(DOCKER_API_TIMEOUT_MS, () => resolve());
       req.end();
     });
   }
@@ -318,13 +411,14 @@ export class IpAliasManager {
   async removeAlias(deviceId: string): Promise<void> {
     const proxy = this.activeProxies.get(deviceId);
     if (!proxy) return;
-    await this.removeProxyContainer(`onvif-proxy-${deviceId}`);
+    const containerName = IpAliasManager.sanitizeContainerName(`onvif-proxy-${deviceId}`);
+    await this.removeProxyContainer(containerName);
     this.activeProxies.delete(deviceId);
     this.console.log(`Removed proxy container for ${proxy.ip}`);
   }
 
   /**
-   * Remove all managed proxies.
+   * Remove all managed proxies. Call on plugin shutdown to prevent orphaned containers.
    */
   async removeAll(): Promise<void> {
     for (const id of [...this.activeProxies.keys()]) {
@@ -334,7 +428,7 @@ export class IpAliasManager {
 
   // ─── Docker API helpers ─────────────────────────────────────────
 
-  private dockerApiGet(path: string): Promise<any> {
+  private dockerApiGet<T = unknown>(path: string): Promise<T> {
     return new Promise((resolve, reject) => {
       const req = http.request(
         { socketPath: DOCKER_SOCKET, path, method: "GET" },
@@ -342,17 +436,21 @@ export class IpAliasManager {
           let data = "";
           res.on("data", (chunk) => (data += chunk));
           res.on("end", () => {
-            try { resolve(JSON.parse(data)); }
+            try { resolve(JSON.parse(data) as T); }
             catch { reject(new Error(data.substring(0, 200))); }
           });
         },
       );
       req.on("error", reject);
+      req.setTimeout(DOCKER_API_TIMEOUT_MS, () => {
+        req.destroy();
+        reject(new Error(`Docker API GET ${path} timed out after ${DOCKER_API_TIMEOUT_MS}ms`));
+      });
       req.end();
     });
   }
 
-  private dockerApiPost(path: string, body: any): Promise<any> {
+  private dockerApiPost<T = unknown>(path: string, body: unknown): Promise<T> {
     return new Promise((resolve, reject) => {
       const bodyStr = JSON.stringify(body);
       const req = http.request(
@@ -366,23 +464,18 @@ export class IpAliasManager {
           let data = "";
           res.on("data", (chunk) => (data += chunk));
           res.on("end", () => {
-            try { resolve(JSON.parse(data)); }
-            catch { resolve({ statusCode: res.statusCode, raw: data.substring(0, 500) }); }
+            try { resolve(JSON.parse(data) as T); }
+            catch { resolve({ statusCode: res.statusCode, raw: data.substring(0, 500) } as T); }
           });
         },
       );
       req.on("error", reject);
+      req.setTimeout(DOCKER_API_TIMEOUT_MS, () => {
+        req.destroy();
+        reject(new Error(`Docker API POST ${path} timed out after ${DOCKER_API_TIMEOUT_MS}ms`));
+      });
       req.write(bodyStr);
       req.end();
-    });
-  }
-
-  private execCommand(cmd: string): Promise<string> {
-    return new Promise((resolve, reject) => {
-      exec(cmd, (err, stdout, stderr) => {
-        if (err) reject(new Error(stderr?.trim() || err.message));
-        else resolve(stdout);
-      });
     });
   }
 }
