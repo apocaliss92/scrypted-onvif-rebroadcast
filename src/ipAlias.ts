@@ -258,10 +258,19 @@ export class IpAliasManager {
     let entrypoint: string[] | undefined;
     if (rtspTargets && rtspTargets.length > 0) {
       // Run multiple socat instances: ONVIF + one per RTSP stream
-      const socatCmds = [`socat TCP-LISTEN:8000,fork,reuseaddr TCP:${scryptedIp}:${proxyPort}`];
+      // Validate hostnames/ports to prevent shell injection
+      const sanitizeHost = (h: string) => {
+        if (!/^[a-zA-Z0-9._-]+$/.test(h)) throw new Error(`Invalid hostname: ${h}`);
+        return h;
+      };
+      const sanitizePort = (p: number) => {
+        if (!Number.isInteger(p) || p < 1 || p > 65535) throw new Error(`Invalid port: ${p}`);
+        return p;
+      };
+      const socatCmds = [`socat TCP-LISTEN:8000,fork,reuseaddr TCP:${sanitizeHost(scryptedIp)}:${sanitizePort(proxyPort)}`];
       rtspTargets.forEach((target, idx) => {
         const listenPort = 554 + idx;
-        socatCmds.push(`socat TCP-LISTEN:${listenPort},fork,reuseaddr TCP:${target.host}:${target.port}`);
+        socatCmds.push(`socat TCP-LISTEN:${sanitizePort(listenPort)},fork,reuseaddr TCP:${sanitizeHost(target.host)}:${sanitizePort(target.port)}`);
       });
       // Override entrypoint to use sh directly (alpine/socat prepends "socat" to Cmd)
       entrypoint = ["/bin/sh"];

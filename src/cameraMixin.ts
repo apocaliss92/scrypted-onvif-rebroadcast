@@ -1,4 +1,5 @@
 import sdk, {
+  Camera,
   EventListenerRegister,
   ObjectsDetected,
   Setting,
@@ -23,7 +24,7 @@ import os from "os";
 
 import type OnvifRebroadcastPlugin from "./main";
 
-const { systemManager } = sdk;
+const { systemManager, mediaManager } = sdk;
 
 function getLocalIp(): string {
   const interfaces = os.networkInterfaces();
@@ -200,8 +201,16 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
         const localIp = getLocalIp();
         const resolvedUrl = rtspUrl.replace("localhost", localIp);
 
-        // Try to find resolution from stream options
-        const matchedOption = streamOptions.find((s) => s.name === streamName);
+        // Try to find resolution from stream options (flexible matching since
+        // rebroadcast subgroups use names like "RTMP main.bcs" while stream
+        // options use "main.bcs" or similar)
+        const matchedOption = streamOptions.find(
+          (s) =>
+            s.name === streamName ||
+            streamName.includes(s.name) ||
+            s.name?.includes(streamName) ||
+            (s.id && streamName.includes(s.id)),
+        );
         const width = matchedOption?.video?.width;
         const height = matchedOption?.video?.height;
 
@@ -213,19 +222,82 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
         });
       }
 
-      this.logger.debug(
+      // Log stream option names for debugging resolution matching
+      if (streamOptions.length > 0) {
+        this.console.log(
+          `${this.name}: stream options: ${streamOptions.map((s: any) => `${s.name ?? s.id ?? "?"} (${s.video?.width ?? "?"}x${s.video?.height ?? "?"})`).join(", ")}`,
+        );
+      }
+
+      this.console.log(
         `${this.name}: found ${this.discoveredStreams.length} RTSP rebroadcast stream(s)`,
       );
       for (const s of this.discoveredStreams) {
-        this.logger.debug(
-          `  - ${s.name}: ${s.rtspUrl} (${s.width ?? "?"}x${s.height ?? "?"})`,
+        this.console.log(
+          `  - ${s.name}: ${this.sanitizeUrl(s.rtspUrl)} (${s.width ?? "?"}x${s.height ?? "?"})`,
         );
+      }
+
+      // If main stream still has no resolution, try probing via snapshot
+      if (this.discoveredStreams.length > 0 && !this.discoveredStreams[0].width) {
+        try {
+          const cam = systemManager.getDeviceById(this.id) as unknown as Camera;
+          if (cam?.takePicture) {
+            const mediaObject = await cam.takePicture();
+            const buffer = await mediaManager.convertMediaObjectToBuffer(mediaObject, "image/jpeg");
+            // Parse JPEG SOF0 marker for resolution
+            const res = this.parseJpegResolution(buffer);
+            if (res) {
+              this.console.log(`${this.name}: detected resolution from snapshot: ${res.width}x${res.height}`);
+              // Apply to all streams that lack resolution (main gets full res, others assumed same)
+              for (const s of this.discoveredStreams) {
+                if (!s.width) {
+                  s.width = res.width;
+                  s.height = res.height;
+                }
+              }
+            }
+          }
+        } catch (e) {
+          this.console.warn(`${this.name}: snapshot resolution probe failed: ${(e as Error).message}`);
+        }
       }
     } catch (e) {
       this.console.warn(
         `Failed to discover streams for ${this.name}: ${(e as Error).message}`,
       );
     }
+  }
+
+  /** Strip embedded credentials from URLs before logging */
+  private sanitizeUrl(url: string): string {
+    return url.replace(/:\/\/[^:]+:[^@]+@/, "://***:***@");
+  }
+
+  /** Parse JPEG SOF0/SOF2 marker to extract width and height */
+  private parseJpegResolution(buf: Buffer): { width: number; height: number } | null {
+    let offset = 0;
+    while (offset < buf.length - 1) {
+      if (buf[offset] !== 0xff) { offset++; continue; }
+      const marker = buf[offset + 1];
+      // SOF0 (0xC0) or SOF2 (0xC2) — baseline or progressive
+      if (marker === 0xc0 || marker === 0xc2) {
+        if (offset + 9 < buf.length) {
+          const height = buf.readUInt16BE(offset + 5);
+          const width = buf.readUInt16BE(offset + 7);
+          if (width > 0 && height > 0) return { width, height };
+        }
+        return null;
+      }
+      if (marker === 0xd8 || marker === 0xd9) { offset += 2; continue; } // SOI/EOI
+      if (offset + 3 < buf.length) {
+        const len = buf.readUInt16BE(offset + 2);
+        offset += 2 + len;
+      } else {
+        break;
+      }
+    }
+    return null;
   }
 
   /**
@@ -373,10 +445,18 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
       onvifIp,
       proxyMode: !!proxyPort,
       onvifPort: port,
-      streams: this.discoveredStreams,
+      // UniFi Protect expects at most 2 ONVIF profiles (main + sub stream).
+      // Exposing all 4 Scrypted rebroadcast streams causes tiled preview artifacts.
+      streams: this.discoveredStreams.slice(0, 2),
       username: username || undefined,
       password: password || undefined,
       capabilities,
+      getSnapshot: async () => {
+        const cam = systemManager.getDeviceById(this.id) as unknown as Camera;
+        if (!cam?.takePicture) throw new Error("Camera does not support snapshots");
+        const mediaObject = await cam.takePicture();
+        return mediaManager.convertMediaObjectToBuffer(mediaObject, "image/jpeg");
+      },
     };
 
     this.onvifServer = new OnvifServer(this.console, config);

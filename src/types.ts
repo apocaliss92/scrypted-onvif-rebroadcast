@@ -41,4 +41,6 @@ export interface OnvifServiceConfig {
     username?: string;
     password?: string;
     capabilities: DeviceCapabilities;
+    /** Callback to get a JPEG snapshot from the camera */
+    getSnapshot?: () => Promise<Buffer>;
 }
