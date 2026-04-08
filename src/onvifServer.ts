@@ -35,6 +35,13 @@ interface PullPointSubscription {
 
 const MAX_EVENTS_PER_SUBSCRIPTION = 200;
 
+const MAX_REQUEST_SIZE = 1024 * 1024; // 1MB
+const MAX_DIGEST_NONCES = 1000;
+const NONCE_EXPIRY_MS = 300_000; // 5 minutes
+const MAX_SUBSCRIPTIONS = 50;
+const SUBSCRIPTION_CLEANUP_INTERVAL_MS = 60_000;
+const SNAPSHOT_MIN_INTERVAL_MS = 1000; // 1 snapshot/sec per server
+
 export class OnvifServer {
   private server: http.Server | null = null;
   private discoverySocket: dgram.Socket | null = null;
@@ -45,6 +52,8 @@ export class OnvifServer {
   private assignedPort: number = 0;
   private subscriptions: Map<string, PullPointSubscription> = new Map();
   private digestNonces: Map<string, number> = new Map(); // nonce → expiry timestamp
+  private subscriptionCleanupTimer: ReturnType<typeof setInterval> | null = null;
+  private lastSnapshotTime: number = 0;
 
   constructor(console: Console, config: OnvifServiceConfig) {
     this.console = console;
@@ -147,6 +156,7 @@ export class OnvifServer {
           `ONVIF server for ${this.config.deviceName} listening on port ${this.assignedPort}`,
         );
         this.startDiscovery();
+        this.startSubscriptionCleanup();
         resolve(this.assignedPort);
       });
     });
@@ -154,7 +164,9 @@ export class OnvifServer {
 
   async stop(): Promise<void> {
     this.stopDiscovery();
+    this.stopSubscriptionCleanup();
     this.subscriptions.clear();
+    this.digestNonces.clear();
 
     return new Promise((resolve) => {
       if (this.server) {
@@ -190,10 +202,18 @@ export class OnvifServer {
     }
 
     let body = "";
+    let aborted = false;
     req.on("data", (chunk) => {
       body += chunk;
+      if (body.length > MAX_REQUEST_SIZE) {
+        aborted = true;
+        res.writeHead(413, { "Content-Type": "text/plain" });
+        res.end("Request too large");
+        req.destroy();
+      }
     });
     req.on("end", () => {
+      if (aborted) return;
       try {
         const response = this.routeSoapRequest(body, url, req);
         if (response === "__HTTP_DIGEST_CHALLENGE__") {
@@ -205,11 +225,11 @@ export class OnvifServer {
         });
         res.end(response);
       } catch (e) {
-        this.console.error("ONVIF request error", (e as Error).message);
+        this.console.error("ONVIF request error");
         res.writeHead(500, {
           "Content-Type": "application/soap+xml; charset=utf-8",
         });
-        res.end(this.soapFault("Server", (e as Error).message));
+        res.end(this.soapFault("Server", "Internal server error"));
       }
     });
   }
@@ -220,13 +240,25 @@ export class OnvifServer {
     for (const [nonce, expiry] of this.digestNonces) {
       if (expiry < now) this.digestNonces.delete(nonce);
     }
+    // Evict oldest nonces if table is full
+    while (this.digestNonces.size >= MAX_DIGEST_NONCES) {
+      const oldest = this.digestNonces.keys().next().value;
+      if (oldest) this.digestNonces.delete(oldest);
+      else break;
+    }
     const nonce = crypto.randomBytes(16).toString("hex");
-    this.digestNonces.set(nonce, now + 300_000); // 5 min expiry
+    this.digestNonces.set(nonce, now + NONCE_EXPIRY_MS);
     res.writeHead(401, {
       "WWW-Authenticate": `Digest realm="ONVIF", nonce="${nonce}", qop="auth"`,
       "Content-Type": "text/plain",
     });
     res.end("Unauthorized");
+  }
+
+  /** Timing-safe string comparison to prevent credential brute-force via timing side-channel */
+  private safeEqual(a: string, b: string): boolean {
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
   }
 
   private validateHttpAuth(req: http.IncomingMessage): boolean {
@@ -237,8 +269,11 @@ export class OnvifServer {
 
     if (authHeader.startsWith("Basic ")) {
       const decoded = Buffer.from(authHeader.slice(6), "base64").toString();
-      const [httpUser, httpPass] = decoded.split(":");
-      return httpUser === username && httpPass === password;
+      const colonIdx = decoded.indexOf(":");
+      if (colonIdx < 0) return false;
+      const httpUser = decoded.slice(0, colonIdx);
+      const httpPass = decoded.slice(colonIdx + 1);
+      return this.safeEqual(httpUser, username) && this.safeEqual(httpPass, password ?? "");
     }
 
     if (authHeader.startsWith("Digest ")) {
@@ -260,7 +295,7 @@ export class OnvifServer {
       params[match[1]] = match[2] ?? match[3];
     }
 
-    if (params.username !== username) return false;
+    if (!this.safeEqual(params.username ?? "", username)) return false;
 
     // Verify nonce is valid
     const nonce = params.nonce;
@@ -276,6 +311,7 @@ export class OnvifServer {
     const cnonce = params.cnonce ?? "";
     const qop = params.qop;
 
+    // MD5 is required by HTTP Digest spec (RFC 2617) — NVR clients only support MD5
     const ha1 = crypto.createHash("md5").update(`${username}:${realm}:${password}`).digest("hex");
     const ha2 = crypto.createHash("md5").update(`${method}:${uri}`).digest("hex");
 
@@ -286,7 +322,10 @@ export class OnvifServer {
       expected = crypto.createHash("md5").update(`${ha1}:${nonce}:${ha2}`).digest("hex");
     }
 
-    return params.response === expected;
+    const valid = this.safeEqual(params.response ?? "", expected);
+    // Invalidate nonce after use to prevent replay attacks
+    if (valid) this.digestNonces.delete(nonce);
+    return valid;
   }
 
   private async handleSnapshotRequest(req: http.IncomingMessage, res: http.ServerResponse) {
@@ -295,6 +334,15 @@ export class OnvifServer {
       res.end("Snapshot not available");
       return;
     }
+
+    // Rate limit snapshots
+    const now = Date.now();
+    if (now - this.lastSnapshotTime < SNAPSHOT_MIN_INTERVAL_MS) {
+      res.writeHead(429, { "Content-Type": "text/plain", "Retry-After": "1" });
+      res.end("Too many requests");
+      return;
+    }
+    this.lastSnapshotTime = now;
 
     try {
       const jpegBuffer = await this.config.getSnapshot();
@@ -397,8 +445,8 @@ export class OnvifServer {
     // 1. Try WS-Security UsernameToken in SOAP body
     const wsUsername = this.extractValue(body, "Username");
     if (wsUsername) {
-      if (wsUsername !== username) {
-        return this.soapFault("Sender", "Not authorized: invalid credentials");
+      if (!this.safeEqual(wsUsername, username)) {
+        return this.soapFault("Sender", "Not authorized");
       }
 
       const wsPassword = this.extractValue(body, "Password");
@@ -414,17 +462,17 @@ export class OnvifServer {
         hash.update(password);
         const expectedDigest = hash.digest("base64");
 
-        if (wsPassword === expectedDigest) {
+        if (this.safeEqual(wsPassword, expectedDigest)) {
           return null;
         }
       }
 
-      // Fallback: plain-text password comparison
-      if (wsPassword === password) {
+      // Plaintext password comparison (some ONVIF clients send PasswordText type)
+      if (password && wsPassword && this.safeEqual(wsPassword, password)) {
         return null;
       }
 
-      return this.soapFault("Sender", "Not authorized: invalid credentials");
+      return this.soapFault("Sender", "Not authorized");
     }
 
     // 2. Try HTTP auth headers (Basic or Digest)
@@ -435,7 +483,7 @@ export class OnvifServer {
     const authHeader = req?.headers?.["authorization"];
     if (authHeader) {
       // Auth header present but validation failed
-      return this.soapFault("Sender", "Not authorized: invalid credentials");
+      return this.soapFault("Sender", "Not authorized");
     }
 
     // 3. No credentials provided — send HTTP 401 Digest challenge
@@ -1173,7 +1221,37 @@ export class OnvifServer {
     </tev:GetServiceCapabilitiesResponse>`);
   }
 
+  private startSubscriptionCleanup() {
+    this.stopSubscriptionCleanup();
+    this.subscriptionCleanupTimer = setInterval(() => {
+      const now = Date.now();
+      for (const [id, sub] of this.subscriptions) {
+        if (sub.terminationTime.getTime() < now) {
+          this.subscriptions.delete(id);
+        }
+      }
+      // Also clean expired digest nonces
+      for (const [nonce, expiry] of this.digestNonces) {
+        if (expiry < now) this.digestNonces.delete(nonce);
+      }
+    }, SUBSCRIPTION_CLEANUP_INTERVAL_MS);
+  }
+
+  private stopSubscriptionCleanup() {
+    if (this.subscriptionCleanupTimer) {
+      clearInterval(this.subscriptionCleanupTimer);
+      this.subscriptionCleanupTimer = null;
+    }
+  }
+
   private createPullPointSubscription(): string {
+    // Cap subscriptions to prevent memory exhaustion
+    if (this.subscriptions.size >= MAX_SUBSCRIPTIONS) {
+      // Evict oldest subscription
+      const oldest = this.subscriptions.keys().next().value;
+      if (oldest) this.subscriptions.delete(oldest);
+    }
+
     const subId = uuidv4();
     const now = new Date();
     const terminationTime = new Date(now.getTime() + 60 * 60 * 1000); // 1 hour
@@ -1505,8 +1583,10 @@ export class OnvifServer {
   }
 
   private extractValue(xml: string, tag: string): string {
-    // Match tag with optional namespace prefix, ensuring exact tag name (not UsernameToken when looking for Username)
-    const regex = new RegExp(`<(?:\\w+:)?${tag}(?:\\s[^>]*)?>([^<]*)<`, "i");
+    // Escape regex metacharacters in tag name to prevent ReDoS
+    const safeTag = tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    // Match tag with optional namespace prefix, ensuring exact tag name
+    const regex = new RegExp(`<(?:\\w+:)?${safeTag}(?:\\s[^>]*)?>([^<]*)<`, "i");
     const match = xml.match(regex);
     return match?.[1]?.trim() ?? "";
   }

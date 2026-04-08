@@ -234,7 +234,7 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
       );
       for (const s of this.discoveredStreams) {
         this.console.log(
-          `  - ${s.name}: ${s.rtspUrl} (${s.width ?? "?"}x${s.height ?? "?"})`,
+          `  - ${s.name}: ${this.sanitizeUrl(s.rtspUrl)} (${s.width ?? "?"}x${s.height ?? "?"})`,
         );
       }
 
@@ -267,6 +267,11 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
         `Failed to discover streams for ${this.name}: ${(e as Error).message}`,
       );
     }
+  }
+
+  /** Strip embedded credentials from URLs before logging */
+  private sanitizeUrl(url: string): string {
+    return url.replace(/:\/\/[^:]+:[^@]+@/, "://***:***@");
   }
 
   /** Parse JPEG SOF0/SOF2 marker to extract width and height */
