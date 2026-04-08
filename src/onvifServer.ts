@@ -44,6 +44,7 @@ export class OnvifServer {
   private deviceUuid: string;
   private assignedPort: number = 0;
   private subscriptions: Map<string, PullPointSubscription> = new Map();
+  private digestNonces: Map<string, number> = new Map(); // nonce → expiry timestamp
 
   constructor(console: Console, config: OnvifServiceConfig) {
     this.console = console;
@@ -175,9 +176,15 @@ export class OnvifServer {
   }
 
   private handleRequest(req: http.IncomingMessage, res: http.ServerResponse) {
-    // Handle snapshot requests (non-SOAP, plain HTTP GET)
     const url = req.url ?? "/";
+
+    // Handle snapshot requests (non-SOAP, plain HTTP GET)
     if (req.method === "GET" && url.startsWith("/snapshot")) {
+      // Authenticate snapshot requests via HTTP Digest/Basic
+      if (this.config.username && !this.validateHttpAuth(req)) {
+        this.sendDigestChallenge(res);
+        return;
+      }
       this.handleSnapshotRequest(req, res);
       return;
     }
@@ -189,6 +196,10 @@ export class OnvifServer {
     req.on("end", () => {
       try {
         const response = this.routeSoapRequest(body, url, req);
+        if (response === "__HTTP_DIGEST_CHALLENGE__") {
+          this.sendDigestChallenge(res);
+          return;
+        }
         res.writeHead(200, {
           "Content-Type": "application/soap+xml; charset=utf-8",
         });
@@ -201,6 +212,81 @@ export class OnvifServer {
         res.end(this.soapFault("Server", (e as Error).message));
       }
     });
+  }
+
+  private sendDigestChallenge(res: http.ServerResponse) {
+    // Clean expired nonces
+    const now = Date.now();
+    for (const [nonce, expiry] of this.digestNonces) {
+      if (expiry < now) this.digestNonces.delete(nonce);
+    }
+    const nonce = crypto.randomBytes(16).toString("hex");
+    this.digestNonces.set(nonce, now + 300_000); // 5 min expiry
+    res.writeHead(401, {
+      "WWW-Authenticate": `Digest realm="ONVIF", nonce="${nonce}", qop="auth"`,
+      "Content-Type": "text/plain",
+    });
+    res.end("Unauthorized");
+  }
+
+  private validateHttpAuth(req: http.IncomingMessage): boolean {
+    const authHeader = req.headers["authorization"];
+    if (!authHeader) return false;
+    const { username, password } = this.config;
+    if (!username) return true;
+
+    if (authHeader.startsWith("Basic ")) {
+      const decoded = Buffer.from(authHeader.slice(6), "base64").toString();
+      const [httpUser, httpPass] = decoded.split(":");
+      return httpUser === username && httpPass === password;
+    }
+
+    if (authHeader.startsWith("Digest ")) {
+      return this.validateDigestAuth(authHeader, req.method ?? "GET");
+    }
+
+    return false;
+  }
+
+  private validateDigestAuth(authHeader: string, method: string): boolean {
+    const { username, password } = this.config;
+    if (!username || !password) return false;
+
+    // Parse Digest parameters
+    const params: Record<string, string> = {};
+    const regex = /(\w+)=(?:"([^"]+)"|(\w+))/g;
+    let match;
+    while ((match = regex.exec(authHeader)) !== null) {
+      params[match[1]] = match[2] ?? match[3];
+    }
+
+    if (params.username !== username) return false;
+
+    // Verify nonce is valid
+    const nonce = params.nonce;
+    if (!nonce || !this.digestNonces.has(nonce)) return false;
+    if (this.digestNonces.get(nonce)! < Date.now()) {
+      this.digestNonces.delete(nonce);
+      return false;
+    }
+
+    const realm = params.realm ?? "ONVIF";
+    const uri = params.uri ?? "/";
+    const nc = params.nc ?? "";
+    const cnonce = params.cnonce ?? "";
+    const qop = params.qop;
+
+    const ha1 = crypto.createHash("md5").update(`${username}:${realm}:${password}`).digest("hex");
+    const ha2 = crypto.createHash("md5").update(`${method}:${uri}`).digest("hex");
+
+    let expected: string;
+    if (qop === "auth") {
+      expected = crypto.createHash("md5").update(`${ha1}:${nonce}:${nc}:${cnonce}:${qop}:${ha2}`).digest("hex");
+    } else {
+      expected = crypto.createHash("md5").update(`${ha1}:${nonce}:${ha2}`).digest("hex");
+    }
+
+    return params.response === expected;
   }
 
   private async handleSnapshotRequest(req: http.IncomingMessage, res: http.ServerResponse) {
@@ -341,19 +427,20 @@ export class OnvifServer {
       return this.soapFault("Sender", "Not authorized: invalid credentials");
     }
 
-    // 2. Try HTTP Basic auth header
+    // 2. Try HTTP auth headers (Basic or Digest)
+    if (req && this.validateHttpAuth(req)) {
+      return null;
+    }
+
     const authHeader = req?.headers?.["authorization"];
-    if (authHeader?.startsWith("Basic ")) {
-      const decoded = Buffer.from(authHeader.slice(6), "base64").toString();
-      const [httpUser, httpPass] = decoded.split(":");
-      if (httpUser === username && httpPass === password) {
-        return null;
-      }
+    if (authHeader) {
+      // Auth header present but validation failed
       return this.soapFault("Sender", "Not authorized: invalid credentials");
     }
 
-    // No credentials provided
-    return this.soapFault("Sender", "Not authorized: missing credentials");
+    // 3. No credentials provided — send HTTP 401 Digest challenge
+    // This signals handleRequest to send a proper 401 response
+    return "__HTTP_DIGEST_CHALLENGE__";
   }
 
   // ─── Device Service ──────────────────────────────────────────────
