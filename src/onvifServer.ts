@@ -175,13 +175,20 @@ export class OnvifServer {
   }
 
   private handleRequest(req: http.IncomingMessage, res: http.ServerResponse) {
+    // Handle snapshot requests (non-SOAP, plain HTTP GET)
+    const url = req.url ?? "/";
+    if (req.method === "GET" && url.startsWith("/snapshot")) {
+      this.handleSnapshotRequest(req, res);
+      return;
+    }
+
     let body = "";
     req.on("data", (chunk) => {
       body += chunk;
     });
     req.on("end", () => {
       try {
-        const response = this.routeSoapRequest(body, req.url ?? "/", req);
+        const response = this.routeSoapRequest(body, url, req);
         res.writeHead(200, {
           "Content-Type": "application/soap+xml; charset=utf-8",
         });
@@ -194,6 +201,28 @@ export class OnvifServer {
         res.end(this.soapFault("Server", (e as Error).message));
       }
     });
+  }
+
+  private async handleSnapshotRequest(req: http.IncomingMessage, res: http.ServerResponse) {
+    if (!this.config.getSnapshot) {
+      res.writeHead(503, { "Content-Type": "text/plain" });
+      res.end("Snapshot not available");
+      return;
+    }
+
+    try {
+      const jpegBuffer = await this.config.getSnapshot();
+      res.writeHead(200, {
+        "Content-Type": "image/jpeg",
+        "Content-Length": jpegBuffer.length,
+        "Cache-Control": "no-cache",
+      });
+      res.end(jpegBuffer);
+    } catch (e) {
+      this.console.error("Snapshot error", (e as Error).message);
+      res.writeHead(500, { "Content-Type": "text/plain" });
+      res.end("Snapshot failed");
+    }
   }
 
   private routeSoapRequest(
@@ -654,10 +683,14 @@ export class OnvifServer {
   }
 
   private getSnapshotUri(body: string): string {
+    const snapshotUrl = this.config.getSnapshot
+      ? `http://${this.serviceIp}:${this.servicePort}/snapshot`
+      : "";
+
     return soapEnvelope(`
     <trt:GetSnapshotUriResponse>
       <trt:MediaUri>
-        <tt:Uri></tt:Uri>
+        <tt:Uri>${snapshotUrl}</tt:Uri>
         <tt:InvalidAfterConnect>false</tt:InvalidAfterConnect>
         <tt:InvalidAfterReboot>false</tt:InvalidAfterReboot>
         <tt:Timeout>PT60S</tt:Timeout>
@@ -666,15 +699,19 @@ export class OnvifServer {
   }
 
   private getVideoSources(): string {
-    return soapEnvelope(`
-    <trt:GetVideoSourcesResponse>
-      <trt:VideoSources token="video_src_0">
+    const sources = this.config.streams.map(
+      (stream, idx) => `
+      <trt:VideoSources token="video_src_${idx}">
         <tt:Framerate>25</tt:Framerate>
         <tt:Resolution>
-          <tt:Width>${this.config.streams[0]?.width ?? 1920}</tt:Width>
-          <tt:Height>${this.config.streams[0]?.height ?? 1080}</tt:Height>
+          <tt:Width>${stream.width ?? 1920}</tt:Width>
+          <tt:Height>${stream.height ?? 1080}</tt:Height>
         </tt:Resolution>
-      </trt:VideoSources>
+      </trt:VideoSources>`,
+    );
+
+    return soapEnvelope(`
+    <trt:GetVideoSourcesResponse>${sources.join("")}
     </trt:GetVideoSourcesResponse>`);
   }
 
