@@ -2,7 +2,6 @@ import http from "http";
 import os from "os";
 import crypto from "crypto";
 import fs from "fs";
-import { execSync } from "child_process";
 
 const DOCKER_SOCKET = "/var/run/docker.sock";
 const DOCKER_API_TIMEOUT_MS = 30000;
@@ -119,7 +118,7 @@ export class IpAliasManager {
    * The shim IP is the subnet base address + 2 (e.g. 192.168.69.2 for a 192.168.69.0/24 subnet).
    * Returns the shim IP on success, or null if creation failed.
    */
-  private ensureMacvlanShim(parentIface: string, ip: string, prefix: number, override?: string): string | null {
+  private async ensureMacvlanShim(parentIface: string, ip: string, prefix: number, override?: string): Promise<string | null> {
     if (this.shimIp !== null) return this.shimIp;
 
     let shimIp: string;
@@ -141,30 +140,28 @@ export class IpAliasManager {
 
     const iface = IpAliasManager.SHIM_IFACE;
 
-    try {
-      const addrOut = execSync(`ip addr show ${iface} 2>/dev/null || true`).toString();
-      if (addrOut.includes(`inet ${shimIp}/`)) {
-        this.console.log(`Macvlan shim ${iface} already up at ${shimIp}`);
-        this.shimIp = shimIp;
-        return shimIp;
-      }
-      if (addrOut.trim()) {
-        execSync(`ip link del ${iface} 2>/dev/null || true`);
-      }
-      execSync(`ip link add ${iface} link ${parentIface} type macvlan mode bridge`);
-      execSync(`ip addr add ${shimIp}/${prefix} dev ${iface}`);
-      execSync(`ip link set ${iface} up`);
+    // Check if already exists via os.networkInterfaces() — no 'ip' binary needed
+    if ((os.networkInterfaces()[iface] ?? []).some(a => a.family === "IPv4" && a.address === shimIp)) {
+      this.console.log(`Macvlan shim ${iface} already up at ${shimIp}`);
       this.shimIp = shimIp;
-      this.console.log(
-        `Created macvlan shim ${iface} at ${shimIp}/${prefix} on ${parentIface} — ` +
-        `proxy containers will use this IP to reach Scrypted`,
-      );
       return shimIp;
+    }
+
+    // Create via a temporary privileged container using the already-pulled alpine/socat image.
+    // Alpine's busybox includes 'ip', so this works even when the Scrypted image lacks iproute2.
+    const cmd = [
+      `ip link del ${iface} 2>/dev/null || true`,
+      `ip link add ${iface} link ${parentIface} type macvlan mode bridge`,
+      `ip addr add ${shimIp}/${prefix} dev ${iface}`,
+      `ip link set ${iface} up`,
+    ].join(" && ");
+
+    try {
+      await this.runPrivilegedCommand(cmd);
     } catch (e: unknown) {
       const msg = ((e as Error).message ?? String(e)).split("\n")[0];
       this.console.error(
-        `Failed to create macvlan shim interface (${msg}). ` +
-        `ONVIF adoption may fail due to macvlan-to-host isolation. ` +
+        `Failed to create macvlan shim (${msg}). ` +
         `Run manually on the Scrypted host:\n` +
         `  ip link add ${iface} link ${parentIface} type macvlan mode bridge && ` +
         `ip addr add ${shimIp}/${prefix} dev ${iface} && ` +
@@ -172,13 +169,79 @@ export class IpAliasManager {
       );
       return null;
     }
+
+    // Verify via os.networkInterfaces()
+    await new Promise(r => setTimeout(r, 500));
+    if ((os.networkInterfaces()[iface] ?? []).some(a => a.family === "IPv4" && a.address === shimIp)) {
+      this.shimIp = shimIp;
+      this.console.log(
+        `Created macvlan shim ${iface} at ${shimIp}/${prefix} on ${parentIface} — ` +
+        `proxy containers will use this IP to reach Scrypted`,
+      );
+      return shimIp;
+    }
+
+    this.console.error(
+      `Shim command ran but ${iface} not visible with IP ${shimIp} — check permissions or set the shim IP manually.`,
+    );
+    return null;
   }
 
-  private removeShim(): void {
-    if (!this.shimIp) return;
+  /**
+   * Run a shell command in a temporary privileged container sharing the host network namespace.
+   * Uses alpine/socat (already pulled) whose busybox includes the 'ip' command.
+   */
+  private async runPrivilegedCommand(cmd: string): Promise<void> {
+    const createResult = await this.dockerApiPost<DockerCreateResponse>("/containers/create", {
+      Image: "alpine/socat:latest",
+      Entrypoint: ["/bin/sh"],
+      Cmd: ["-c", cmd],
+      HostConfig: {
+        NetworkMode: "host",
+        Privileged: true,
+      },
+    });
+
+    if (!createResult?.Id) {
+      throw new Error(`Failed to create privileged helper container: ${JSON.stringify(createResult)}`);
+    }
+
+    const id = createResult.Id;
     try {
-      execSync(`ip link del ${IpAliasManager.SHIM_IFACE} 2>/dev/null || true`);
-      this.console.log(`Removed macvlan shim ${IpAliasManager.SHIM_IFACE}`);
+      await this.dockerApiPost(`/containers/${id}/start`, {});
+
+      // Poll until the container exits (max 15 seconds)
+      const deadline = Date.now() + 15000;
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 300));
+        const info = await this.dockerApiGet<DockerContainerInfo>(`/containers/${id}/json`);
+        if (!info?.State?.Running) {
+          if ((info?.State?.ExitCode ?? 0) !== 0) {
+            throw new Error(`Privileged helper exited with code ${info?.State?.ExitCode}`);
+          }
+          return;
+        }
+      }
+      throw new Error("Privileged helper container timed out after 15 seconds");
+    } finally {
+      await new Promise<void>((resolve) => {
+        const req = http.request(
+          { socketPath: DOCKER_SOCKET, path: `/containers/${id}?force=true`, method: "DELETE" },
+          (res) => { res.resume(); res.on("end", () => resolve()); },
+        );
+        req.on("error", () => resolve());
+        req.setTimeout(DOCKER_API_TIMEOUT_MS, () => resolve());
+        req.end();
+      });
+    }
+  }
+
+  private async removeShim(): Promise<void> {
+    if (!this.shimIp) return;
+    const iface = IpAliasManager.SHIM_IFACE;
+    try {
+      await this.runPrivilegedCommand(`ip link del ${iface} 2>/dev/null || true`);
+      this.console.log(`Removed macvlan shim ${iface}`);
     } catch {
       // Best effort
     }
@@ -339,7 +402,7 @@ export class IpAliasManager {
       // kernel macvlan-to-host isolation. Create a shim interface so they can.
       const hostIpForCheck = this.getContainerIp();
       if (this.needsMacvlanShim(hostIpForCheck, ip, prefix)) {
-        this.ensureMacvlanShim(parentIface, ip, prefix, shimIpOverride);
+        await this.ensureMacvlanShim(parentIface, ip, prefix, shimIpOverride);
       }
 
       // Ensure socat image is available
@@ -546,7 +609,7 @@ export class IpAliasManager {
     for (const id of [...this.activeProxies.keys()]) {
       await this.removeAlias(id);
     }
-    this.removeShim();
+    await this.removeShim();
   }
 
   // ─── Docker API helpers ─────────────────────────────────────────
