@@ -24,6 +24,7 @@ interface DockerContainerState {
 interface DockerContainerNetworkSettings {
   IPAddress?: string;
   MacAddress?: string;
+  NetworkID?: string;
 }
 
 interface DockerContainerInfo {
@@ -48,6 +49,7 @@ export class IpAliasManager {
   private nextProxyPort = 18000;
   private initLock: Promise<void> | null = null;
   private shimIp: string | null = null;
+  private bridgeConnection: { networkId: string; networkName: string; containerIp: string } | null | undefined = undefined;
   private static readonly SHIM_IFACE = "macvlan-shim0";
 
   constructor(console: Console) {
@@ -271,6 +273,45 @@ export class IpAliasManager {
   }
 
   /**
+   * Detect the Docker bridge network Scrypted's own container is attached to.
+   * When found, proxy containers can be connected to that bridge and reach
+   * Scrypted via its bridge IP — no shim or privileged operations needed.
+   * Returns null when not running in Docker or no bridge network is found.
+   */
+  private async findBridgeConnection(): Promise<{ networkId: string; networkName: string; containerIp: string } | null> {
+    if (!this.hasDockerSocket()) return null;
+
+    let selfId: string;
+    try {
+      selfId = fs.readFileSync("/etc/hostname", "utf8").trim();
+    } catch {
+      return null;
+    }
+    if (!selfId) return null;
+
+    try {
+      const info = await this.dockerApiGet<DockerContainerInfo>(`/containers/${selfId}/json`);
+      const nets = info?.NetworkSettings?.Networks;
+      if (!nets) return null;
+
+      const allNetworks = (await this.dockerApiGet<DockerNetwork[]>("/networks")) || [];
+      const bridgeIds = new Set(allNetworks.filter((n) => n.Driver === "bridge").map((n) => n.Id));
+
+      for (const [name, net] of Object.entries(nets)) {
+        if (net.NetworkID && bridgeIds.has(net.NetworkID) && net.IPAddress) {
+          this.console.log(
+            `Detected Docker bridge '${name}' at ${net.IPAddress} — proxy containers will connect via bridge to reach Scrypted`,
+          );
+          return { networkId: net.NetworkID, networkName: name, containerIp: net.IPAddress };
+        }
+      }
+    } catch {
+      // Not running in Docker or bridge detection failed — shim/gateway-route fallback will be used
+    }
+    return null;
+  }
+
+  /**
    * Allocate a unique port for the ONVIF server to listen on internally.
    * This port is proxied through the macvlan proxy container.
    */
@@ -399,12 +440,22 @@ export class IpAliasManager {
       const netOk = await this.ensureMacvlanNetwork(parentIface, subnet, gateway);
       if (!netOk) return false;
 
-      // When Scrypted's IP is on the same subnet as the macvlan network (native install or
-      // Docker with --network=host), macvlan containers cannot reach it directly due to
-      // kernel macvlan-to-host isolation. Create a shim interface so they can.
-      const hostIpForCheck = this.getContainerIp();
-      if (this.needsMacvlanShim(hostIpForCheck, ip, prefix)) {
-        await this.ensureMacvlanShim(parentIface, ip, prefix, shimIpOverride);
+      // Fast path: if Scrypted runs in Docker bridge mode, detect its bridge network.
+      // Proxy containers will be connected to that bridge so socat can reach Scrypted
+      // via its bridge IP — no shim or privileged operations needed.
+      if (this.bridgeConnection === undefined) {
+        this.bridgeConnection = await this.findBridgeConnection();
+      }
+
+      // When Scrypted's IP is on the same LAN subnet as the macvlan network (native
+      // install or Docker with --network=host), macvlan containers cannot reach it
+      // directly due to kernel macvlan-to-host isolation. Create a shim interface.
+      // Skip this when bridge mode is already handling reachability.
+      if (!this.bridgeConnection) {
+        const hostIpForCheck = this.getContainerIp();
+        if (this.needsMacvlanShim(hostIpForCheck, ip, prefix)) {
+          await this.ensureMacvlanShim(parentIface, ip, prefix, shimIpOverride);
+        }
       }
 
       // Ensure socat image is available
@@ -418,7 +469,11 @@ export class IpAliasManager {
     const proxyPort = this.allocateProxyPort();
     let scryptedIp = this.getContainerIp();
     let needsGatewayRoute = false;
-    if (this.needsMacvlanShim(scryptedIp, ip, prefix)) {
+    if (this.bridgeConnection) {
+      // Docker bridge mode: proxy connects to the bridge and reaches Scrypted via its
+      // bridge IP. Bridge-to-bridge traffic bypasses macvlan-to-host kernel isolation.
+      scryptedIp = this.bridgeConnection.containerIp;
+    } else if (this.needsMacvlanShim(scryptedIp, ip, prefix)) {
       if (this.shimIp) {
         // Shim created successfully — proxy containers use the shim IP to reach Scrypted
         scryptedIp = this.shimIp;
@@ -510,6 +565,20 @@ export class IpAliasManager {
       this.console.error(`Failed to start proxy container for ${ip}: ${startResult.message}`);
       await this.removeProxyContainer(containerName);
       return { ok: false };
+    }
+
+    // Connect to Scrypted's bridge network so socat can reach its bridge IP
+    if (this.bridgeConnection) {
+      try {
+        await this.dockerApiPost(`/networks/${this.bridgeConnection.networkId}/connect`, {
+          Container: createResult.Id,
+        });
+      } catch (e: unknown) {
+        this.console.warn(
+          `Failed to connect proxy to bridge '${this.bridgeConnection.networkName}': ${(e as Error).message}. ` +
+          `ONVIF forwarding may fail.`,
+        );
+      }
     }
 
     // Wait a moment then verify it's running
