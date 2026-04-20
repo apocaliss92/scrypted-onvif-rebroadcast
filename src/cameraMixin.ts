@@ -48,6 +48,7 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
   };
   private onvifServer: OnvifServer | null = null;
   private discoveredStreams: RtspStreamInfo[] = [];
+  private discoveredHasAudio = true;
   private assignedPort: number = 0;
   private killed = false;
   private motionListener: EventListenerRegister | null = null;
@@ -222,6 +223,15 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
         });
       }
 
+      // Detect audio: only treat as silent if every stream option explicitly
+      // reports audio: null. Otherwise assume audio is present so the NVR
+      // records it (advertising an audio track that turns out silent is
+      // harmless; the previous behavior of never advertising audio meant
+      // NVRs like UniFi Protect dropped the audio track entirely).
+      this.discoveredHasAudio =
+        streamOptions.length === 0 ||
+        !streamOptions.every((s: any) => s?.audio === null);
+
       // Log stream option names for debugging resolution matching
       if (streamOptions.length > 0) {
         this.console.log(
@@ -313,6 +323,7 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
     const capabilities: DeviceCapabilities = {
       hasPtz: has(ScryptedInterface.PanTiltZoom),
       hasIntercom: has(ScryptedInterface.Intercom),
+      hasAudio: this.discoveredHasAudio,
       hasMotionSensor: has(ScryptedInterface.MotionSensor),
       hasAudioSensor: has(ScryptedInterface.AudioSensor),
       hasObjectDetection: has(ScryptedInterface.ObjectDetector),
@@ -336,7 +347,7 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
     }
 
     this.logger.debug(
-      `${this.name} capabilities: PTZ=${capabilities.hasPtz}, Intercom=${capabilities.hasIntercom}, Motion=${capabilities.hasMotionSensor}, Audio=${capabilities.hasAudioSensor}, ObjectDetect=${capabilities.hasObjectDetection}`,
+      `${this.name} capabilities: PTZ=${capabilities.hasPtz}, Intercom=${capabilities.hasIntercom}, Audio=${capabilities.hasAudio}, Motion=${capabilities.hasMotionSensor}, AudioSensor=${capabilities.hasAudioSensor}, ObjectDetect=${capabilities.hasObjectDetection}`,
     );
 
     return capabilities;
@@ -391,7 +402,8 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
           })
           .filter((t): t is { host: string; port: number } => t !== null);
 
-        const result = await this.plugin.ipAliasManager.addAlias(this.id, assignedIp, iface, prefix, gateway, rtspTargets);
+        const shimIp = (this.plugin.storageSettings.values.macvlanShimIp as string) || undefined;
+        const result = await this.plugin.ipAliasManager.addAlias(this.id, assignedIp, iface, prefix, gateway, rtspTargets, shimIp);
         if (result.ok && result.proxyPort) {
           onvifIp = assignedIp;
           proxyPort = result.proxyPort;

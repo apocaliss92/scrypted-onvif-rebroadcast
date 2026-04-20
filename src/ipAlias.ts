@@ -2,6 +2,7 @@ import http from "http";
 import os from "os";
 import crypto from "crypto";
 import fs from "fs";
+import { execSync } from "child_process";
 
 const DOCKER_SOCKET = "/var/run/docker.sock";
 const DOCKER_API_TIMEOUT_MS = 30000;
@@ -47,6 +48,8 @@ export class IpAliasManager {
   private networkCreated = false;
   private nextProxyPort = 18000;
   private initLock: Promise<void> | null = null;
+  private shimIp: string | null = null;
+  private static readonly SHIM_IFACE = "macvlan-shim0";
 
   constructor(console: Console) {
     this.console = console;
@@ -89,6 +92,97 @@ export class IpAliasManager {
    */
   private static sanitizeContainerName(name: string): string {
     return name.replace(/[^a-zA-Z0-9_.-]/g, "_");
+  }
+
+  /**
+   * Returns true when Scrypted's IP is in the same subnet as the macvlan network,
+   * meaning macvlan-to-host kernel isolation will block proxy containers from reaching it.
+   *
+   * This covers both native installs and Docker with host networking (--network=host),
+   * where Scrypted gets a LAN IP instead of a Docker bridge IP (172.x.x.x).
+   * Docker bridge networking is unaffected — bridge IPs are in a different subnet.
+   */
+  private needsMacvlanShim(scryptedIp: string, macvlanIp: string, prefix: number): boolean {
+    const toNum = (ip: string) =>
+      ip.split(".").map(Number).reduce((acc, n) => ((acc << 8) | n) >>> 0, 0) >>> 0;
+    const mask = (~0 << (32 - prefix)) >>> 0;
+    return (toNum(scryptedIp) & mask) === (toNum(macvlanIp) & mask);
+  }
+
+  /**
+   * Create a macvlan shim interface on the host so macvlan proxy containers can reach Scrypted.
+   *
+   * When Scrypted runs natively, its physical interface IP is unreachable from macvlan containers
+   * (kernel drops macvlan→host traffic at the interface level). A shim macvlan interface gives
+   * the host itself a presence on the macvlan subnet, breaking the isolation.
+   *
+   * The shim IP is the subnet base address + 2 (e.g. 192.168.69.2 for a 192.168.69.0/24 subnet).
+   * Returns the shim IP on success, or null if creation failed.
+   */
+  private ensureMacvlanShim(parentIface: string, ip: string, prefix: number, override?: string): string | null {
+    if (this.shimIp !== null) return this.shimIp;
+
+    let shimIp: string;
+    if (override) {
+      shimIp = override;
+    } else {
+      const ipParts = ip.split(".").map(Number);
+      const ipNum = ((ipParts[0] << 24) | (ipParts[1] << 16) | (ipParts[2] << 8) | ipParts[3]) >>> 0;
+      const mask = (~0 << (32 - prefix)) >>> 0;
+      const netNum = (ipNum & mask) >>> 0;
+      const shimNum = netNum + 2;
+      shimIp = [
+        (shimNum >>> 24) & 0xff,
+        (shimNum >>> 16) & 0xff,
+        (shimNum >>> 8) & 0xff,
+        shimNum & 0xff,
+      ].join(".");
+    }
+
+    const iface = IpAliasManager.SHIM_IFACE;
+
+    try {
+      const addrOut = execSync(`ip addr show ${iface} 2>/dev/null || true`).toString();
+      if (addrOut.includes(`inet ${shimIp}/`)) {
+        this.console.log(`Macvlan shim ${iface} already up at ${shimIp}`);
+        this.shimIp = shimIp;
+        return shimIp;
+      }
+      if (addrOut.trim()) {
+        execSync(`ip link del ${iface} 2>/dev/null || true`);
+      }
+      execSync(`ip link add ${iface} link ${parentIface} type macvlan mode bridge`);
+      execSync(`ip addr add ${shimIp}/${prefix} dev ${iface}`);
+      execSync(`ip link set ${iface} up`);
+      this.shimIp = shimIp;
+      this.console.log(
+        `Created macvlan shim ${iface} at ${shimIp}/${prefix} on ${parentIface} — ` +
+        `proxy containers will use this IP to reach Scrypted`,
+      );
+      return shimIp;
+    } catch (e: unknown) {
+      const msg = ((e as Error).message ?? String(e)).split("\n")[0];
+      this.console.error(
+        `Failed to create macvlan shim interface (${msg}). ` +
+        `ONVIF adoption may fail due to macvlan-to-host isolation. ` +
+        `Run manually on the Scrypted host:\n` +
+        `  ip link add ${iface} link ${parentIface} type macvlan mode bridge && ` +
+        `ip addr add ${shimIp}/${prefix} dev ${iface} && ` +
+        `ip link set ${iface} up`,
+      );
+      return null;
+    }
+  }
+
+  private removeShim(): void {
+    if (!this.shimIp) return;
+    try {
+      execSync(`ip link del ${IpAliasManager.SHIM_IFACE} 2>/dev/null || true`);
+      this.console.log(`Removed macvlan shim ${IpAliasManager.SHIM_IFACE}`);
+    } catch {
+      // Best effort
+    }
+    this.shimIp = null;
   }
 
   private hasDockerSocket(): boolean {
@@ -202,6 +296,7 @@ export class IpAliasManager {
     prefix: number,
     gatewayOverride?: string,
     rtspTargets?: { port: number; host: string }[],
+    shimIpOverride?: string,
   ): Promise<{ ok: boolean; proxyPort?: number }> {
     if (!this.hasDockerSocket()) {
       this.console.error(`Docker socket not found at ${DOCKER_SOCKET}`);
@@ -239,6 +334,14 @@ export class IpAliasManager {
       const netOk = await this.ensureMacvlanNetwork(parentIface, subnet, gateway);
       if (!netOk) return false;
 
+      // When Scrypted's IP is on the same subnet as the macvlan network (native install or
+      // Docker with --network=host), macvlan containers cannot reach it directly due to
+      // kernel macvlan-to-host isolation. Create a shim interface so they can.
+      const hostIpForCheck = this.getContainerIp();
+      if (this.needsMacvlanShim(hostIpForCheck, ip, prefix)) {
+        this.ensureMacvlanShim(parentIface, ip, prefix, shimIpOverride);
+      }
+
       // Ensure socat image is available
       await this.ensureSocatImage();
       return true;
@@ -248,7 +351,17 @@ export class IpAliasManager {
 
     // Allocate a unique internal port for the ONVIF server
     const proxyPort = this.allocateProxyPort();
-    const scryptedIp = this.getContainerIp();
+    let scryptedIp = this.getContainerIp();
+    if (this.needsMacvlanShim(scryptedIp, ip, prefix)) {
+      if (this.shimIp) {
+        scryptedIp = this.shimIp;
+      } else {
+        this.console.warn(
+          `Scrypted IP ${scryptedIp} is on the macvlan subnet — shim creation failed. ` +
+          `Falling back to host IP. ONVIF adoption may fail.`,
+        );
+      }
+    }
 
     // Remove existing proxy container if any
     await this.removeProxyContainer(containerName);
@@ -433,6 +546,7 @@ export class IpAliasManager {
     for (const id of [...this.activeProxies.keys()]) {
       await this.removeAlias(id);
     }
+    this.removeShim();
   }
 
   // ─── Docker API helpers ─────────────────────────────────────────

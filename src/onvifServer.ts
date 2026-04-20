@@ -648,7 +648,7 @@ export class OnvifServer {
       </tds:Scopes>`;
     }
 
-    if (caps.hasIntercom) {
+    if (caps.hasAudio) {
       scopes += `
       <tds:Scopes>
         <tt:ScopeDef>Fixed</tt:ScopeDef>
@@ -718,7 +718,7 @@ export class OnvifServer {
 
       let audioSourceXml = "";
       let audioEncoderXml = "";
-      if (caps.hasIntercom) {
+      if (caps.hasAudio) {
         audioSourceXml = `
         <tt:AudioSourceConfiguration token="asrc_0">
           <tt:Name>AudioSource_0</tt:Name>
@@ -893,7 +893,7 @@ export class OnvifServer {
 
   private getAudioSources(): string {
     const caps = this.config.capabilities;
-    if (!caps.hasIntercom) {
+    if (!caps.hasAudio) {
       return soapEnvelope(`<trt:GetAudioSourcesResponse/>`);
     }
 
@@ -907,7 +907,7 @@ export class OnvifServer {
 
   private getAudioSourceConfigurations(): string {
     const caps = this.config.capabilities;
-    if (!caps.hasIntercom) {
+    if (!caps.hasAudio) {
       return soapEnvelope(`<trt:GetAudioSourceConfigurationsResponse/>`);
     }
 
@@ -923,7 +923,7 @@ export class OnvifServer {
 
   private getAudioEncoderConfigurations(): string {
     const caps = this.config.capabilities;
-    if (!caps.hasIntercom) {
+    if (!caps.hasAudio) {
       return soapEnvelope(`<trt:GetAudioEncoderConfigurationsResponse/>`);
     }
 
@@ -1519,7 +1519,7 @@ export class OnvifServer {
     if (this.config.capabilities.hasPtz) {
       scopes.push("onvif://www.onvif.org/type/ptz");
     }
-    if (this.config.capabilities.hasIntercom) {
+    if (this.config.capabilities.hasAudio) {
       scopes.push("onvif://www.onvif.org/type/audio_encoder");
     }
     if (this.config.capabilities.hasIntercom) {

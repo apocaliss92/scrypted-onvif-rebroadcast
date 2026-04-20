@@ -13,6 +13,7 @@ export interface DeviceCapabilities {
         zoom?: boolean;
     };
     hasIntercom: boolean;
+    hasAudio: boolean;
     hasMotionSensor: boolean;
     hasAudioSensor: boolean;
     hasObjectDetection: boolean;

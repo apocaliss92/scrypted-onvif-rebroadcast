@@ -71,6 +71,16 @@ export default class OnvifRebroadcastPlugin
       placeholder: "192.168.1.1",
       group: "IP Allocation",
     },
+    macvlanShimIp: {
+      title: "Macvlan shim IP (native host only)",
+      description:
+        "IP address for the macvlan shim interface created on the host when Scrypted runs outside Docker. " +
+        "Must be in the same subnet as the IP range but not used by any other device or proxy. " +
+        "Leave empty to auto-assign (subnet base + 2, e.g. 192.168.1.2 for a 192.168.1.0/24 network).",
+      type: "string",
+      placeholder: "192.168.1.2",
+      group: "IP Allocation",
+    },
   });
 
   constructor(nativeId: string) {
