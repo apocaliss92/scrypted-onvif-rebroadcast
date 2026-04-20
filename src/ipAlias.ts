@@ -114,6 +114,45 @@ export class IpAliasManager {
   }
 
   /**
+   * Find a Docker bridge network that Scrypted itself is connected to, and
+   * return our IP on it. macvlan proxy containers will also join this bridge
+   * so they can forward traffic to Scrypted without hitting the macvlan-to-host
+   * isolation wall (Linux macvlan containers cannot reach the host's physical IP).
+   */
+  private async findBridgeConnection(): Promise<{ network: string; ip: string } | null> {
+    try {
+      // Collect all our own IPs so we can identify which container is "us"
+      const myIps = new Set<string>();
+      for (const addrs of Object.values(os.networkInterfaces())) {
+        for (const addr of addrs ?? []) {
+          if (addr.family === "IPv4") myIps.add(addr.address);
+        }
+      }
+
+      interface NetworkSummary { Id: string; Name: string; Driver: string; }
+      interface NetworkDetail {
+        Name: string;
+        Containers?: Record<string, { IPv4Address: string }>;
+      }
+
+      const networks = await this.dockerApiGet<NetworkSummary[]>("/networks");
+      for (const net of networks ?? []) {
+        if (net.Driver !== "bridge") continue;
+        const detail = await this.dockerApiGet<NetworkDetail>(`/networks/${net.Id}`);
+        for (const container of Object.values(detail?.Containers ?? {})) {
+          const ip = (container as { IPv4Address: string }).IPv4Address?.split("/")[0];
+          if (ip && myIps.has(ip)) {
+            return { network: net.Name, ip };
+          }
+        }
+      }
+    } catch (e: unknown) {
+      this.console.debug?.(`Bridge network detection failed: ${(e as Error).message}`);
+    }
+    return null;
+  }
+
+  /**
    * Allocate a unique port for the ONVIF server to listen on internally.
    * This port is proxied through the macvlan proxy container.
    */
@@ -248,7 +287,20 @@ export class IpAliasManager {
 
     // Allocate a unique internal port for the ONVIF server
     const proxyPort = this.allocateProxyPort();
-    const scryptedIp = this.getContainerIp();
+
+    // Prefer a Docker bridge IP over the physical host IP.
+    // macvlan containers cannot reach the Docker host via its physical IP due to
+    // Linux macvlan isolation — socat would connect to the host and get EHOSTUNREACH.
+    // Connecting the proxy to the same bridge network as Scrypted bypasses this.
+    const bridge = await this.findBridgeConnection();
+    const scryptedIp = bridge?.ip ?? this.getContainerIp();
+    if (!bridge) {
+      this.console.warn(
+        "Scrypted does not appear to be on a Docker bridge network. " +
+        "Falling back to host IP for socat forwarding — if ONVIF adoption fails, " +
+        "a macvlan shim interface on the host may be required."
+      );
+    }
 
     // Remove existing proxy container if any
     await this.removeProxyContainer(containerName);
@@ -315,6 +367,17 @@ export class IpAliasManager {
       this.console.error(`Failed to start proxy container for ${ip}: ${startResult.message}`);
       await this.removeProxyContainer(containerName);
       return { ok: false };
+    }
+
+    // Connect the proxy container to Scrypted's bridge network so socat can reach
+    // Scrypted via the bridge IP (macvlan containers cannot reach the host physical IP).
+    if (bridge) {
+      try {
+        await this.dockerApiPost(`/networks/${bridge.network}/connect`, { Container: createResult.Id });
+        this.console.log(`Proxy container connected to bridge network '${bridge.network}' → socat target ${bridge.ip}:${proxyPort}`);
+      } catch (e: unknown) {
+        this.console.warn(`Could not connect proxy to bridge network '${bridge.network}': ${(e as Error).message}`);
+      }
     }
 
     // Wait a moment then verify it's running
