@@ -279,6 +279,7 @@ export class IpAliasManager {
   }
 
   private macvlanNetworkName: string | null = null;
+  private macvlanGateway: string | null = null;
   private static readonly NETWORK_NAME = "onvif_cameras";
 
   /**
@@ -392,6 +393,7 @@ export class IpAliasManager {
       const netNum = (ipNum & mask) >>> 0;
       const subnet = `${(netNum >>> 24) & 0xff}.${(netNum >>> 16) & 0xff}.${(netNum >>> 8) & 0xff}.${netNum & 0xff}/${prefix}`;
       const gateway = gatewayOverride || `${ipParts[0]}.${ipParts[1]}.${ipParts[2]}.1`;
+      this.macvlanGateway = gateway;
 
       // Ensure macvlan network exists on the specified parent interface
       const netOk = await this.ensureMacvlanNetwork(parentIface, subnet, gateway);
@@ -415,9 +417,20 @@ export class IpAliasManager {
     // Allocate a unique internal port for the ONVIF server
     const proxyPort = this.allocateProxyPort();
     let scryptedIp = this.getContainerIp();
+    let needsGatewayRoute = false;
     if (this.needsMacvlanShim(scryptedIp, ip, prefix)) {
       if (this.shimIp) {
+        // Shim created successfully — proxy containers use the shim IP to reach Scrypted
         scryptedIp = this.shimIp;
+      } else if (this.macvlanGateway) {
+        // Shim unavailable (e.g. VM hypervisor blocks macvlan-to-macvlan traffic).
+        // Add a host-specific route in each proxy container so traffic to Scrypted goes
+        // via the gateway instead of direct ARP, bypassing macvlan-to-host isolation.
+        needsGatewayRoute = true;
+        this.console.log(
+          `Scrypted IP ${scryptedIp} is on the macvlan subnet and shim is unavailable. ` +
+          `Adding gateway route (via ${this.macvlanGateway}) in proxy containers.`,
+        );
       } else {
         this.console.warn(
           `Scrypted IP ${scryptedIp} is on the macvlan subnet — shim creation failed. ` +
@@ -430,30 +443,34 @@ export class IpAliasManager {
     await this.removeProxyContainer(containerName);
 
     // Build socat command: always proxy ONVIF (8000), optionally proxy RTSP (554+)
+    // Validate hostnames/ports to prevent shell injection
+    const sanitizeHost = (h: string) => {
+      if (!/^[a-zA-Z0-9._-]+$/.test(h)) throw new Error(`Invalid hostname: ${h}`);
+      return h;
+    };
+    const sanitizePort = (p: number) => {
+      if (!Number.isInteger(p) || p < 1 || p > 65535) throw new Error(`Invalid port: ${p}`);
+      return p;
+    };
+
+    // When using the gateway route fallback, prefix the sh command with the route setup.
+    // busybox 'ip' is available in alpine/socat; '|| true' makes it idempotent on restart.
+    const routePrefix = needsGatewayRoute && this.macvlanGateway
+      ? `ip route add ${sanitizeHost(scryptedIp)}/32 via ${sanitizeHost(this.macvlanGateway)} 2>/dev/null || true && `
+      : '';
+
     let cmd: string[];
-    let entrypoint: string[] | undefined;
+    const entrypoint = ["/bin/sh"];
     if (rtspTargets && rtspTargets.length > 0) {
       // Run multiple socat instances: ONVIF + one per RTSP stream
-      // Validate hostnames/ports to prevent shell injection
-      const sanitizeHost = (h: string) => {
-        if (!/^[a-zA-Z0-9._-]+$/.test(h)) throw new Error(`Invalid hostname: ${h}`);
-        return h;
-      };
-      const sanitizePort = (p: number) => {
-        if (!Number.isInteger(p) || p < 1 || p > 65535) throw new Error(`Invalid port: ${p}`);
-        return p;
-      };
       const socatCmds = [`socat TCP-LISTEN:8000,fork,reuseaddr TCP:${sanitizeHost(scryptedIp)}:${sanitizePort(proxyPort)}`];
       rtspTargets.forEach((target, idx) => {
         const listenPort = 554 + idx;
         socatCmds.push(`socat TCP-LISTEN:${sanitizePort(listenPort)},fork,reuseaddr TCP:${sanitizeHost(scryptedIp)}:${sanitizePort(target.port)}`);
       });
-      // Override entrypoint to use sh directly (alpine/socat prepends "socat" to Cmd)
-      entrypoint = ["/bin/sh"];
-      cmd = ["-c", socatCmds.map((c) => `${c} &`).join(" ") + " wait"];
+      cmd = ["-c", routePrefix + socatCmds.map((c) => `${c} &`).join(" ") + " wait"];
     } else {
-      cmd = [`TCP-LISTEN:8000,fork,reuseaddr`, `TCP:${scryptedIp}:${proxyPort}`];
-      entrypoint = undefined;
+      cmd = ["-c", `${routePrefix}socat TCP-LISTEN:8000,fork,reuseaddr TCP:${sanitizeHost(scryptedIp)}:${sanitizePort(proxyPort)}`];
     }
 
     // Create proxy container on our dedicated macvlan network with unique MAC
@@ -465,6 +482,8 @@ export class IpAliasManager {
       HostConfig: {
         RestartPolicy: { Name: "unless-stopped" },
         NetworkMode: this.macvlanNetworkName!,
+        // NET_ADMIN required when adding a host-specific route at container startup
+        ...(needsGatewayRoute ? { CapAdd: ["NET_ADMIN"] } : {}),
       },
       NetworkingConfig: {
         EndpointsConfig: {
