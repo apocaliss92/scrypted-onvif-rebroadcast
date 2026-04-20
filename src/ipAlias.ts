@@ -446,7 +446,7 @@ export class IpAliasManager {
       const socatCmds = [`socat TCP-LISTEN:8000,fork,reuseaddr TCP:${sanitizeHost(scryptedIp)}:${sanitizePort(proxyPort)}`];
       rtspTargets.forEach((target, idx) => {
         const listenPort = 554 + idx;
-        socatCmds.push(`socat TCP-LISTEN:${sanitizePort(listenPort)},fork,reuseaddr TCP:${sanitizeHost(target.host)}:${sanitizePort(target.port)}`);
+        socatCmds.push(`socat TCP-LISTEN:${sanitizePort(listenPort)},fork,reuseaddr TCP:${sanitizeHost(scryptedIp)}:${sanitizePort(target.port)}`);
       });
       // Override entrypoint to use sh directly (alpine/socat prepends "socat" to Cmd)
       entrypoint = ["/bin/sh"];
