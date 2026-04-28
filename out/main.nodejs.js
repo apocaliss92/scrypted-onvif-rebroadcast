@@ -2419,6 +2419,7 @@ class IpAliasManager {
         this.nextProxyPort = 18000;
         this.initLock = null;
         this.macvlanNetworkName = null;
+        this.networkOwnedByUs = false;
         this.console = console;
     }
     static generateMac(deviceId) {
@@ -2516,6 +2517,25 @@ class IpAliasManager {
     allocateProxyPort() {
         return this.nextProxyPort++;
     }
+    /** Returns true if `ip` falls within `subnet` (e.g. "192.168.1.0/24"). */
+    static ipInSubnet(ip, subnet) {
+        const [netStr, prefixStr] = subnet.split("/");
+        const prefix = parseInt(prefixStr, 10);
+        if (!Number.isFinite(prefix) || prefix < 0 || prefix > 32)
+            return false;
+        const toNum = (s) => {
+            const p = s.split(".").map(Number);
+            if (p.length !== 4 || p.some((n) => !Number.isFinite(n) || n < 0 || n > 255))
+                return null;
+            return ((p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]) >>> 0;
+        };
+        const ipNum = toNum(ip);
+        const netNum = toNum(netStr);
+        if (ipNum === null || netNum === null)
+            return false;
+        const mask = prefix === 0 ? 0 : (~0 << (32 - prefix)) >>> 0;
+        return (ipNum & mask) === (netNum & mask);
+    }
     /**
      * Serialize access to shared Docker initialization (network + image).
      * Prevents race conditions when multiple cameras initialize simultaneously.
@@ -2539,20 +2559,51 @@ class IpAliasManager {
      * This is separate from the Scrypted container's ipvlan network (br0.2),
      * giving each proxy container a unique MAC address.
      */
-    async ensureMacvlanNetwork(parentIface, subnet, gateway) {
+    async ensureMacvlanNetwork(parentIface, subnet, gateway, ip) {
         if (this.macvlanNetworkName)
             return true;
         const networks = (await this.dockerApiGet("/networks")) || [];
         const netSummary = networks.map((n) => `${n.Name}(${n.Driver})`).join(", ");
         this.console.log(`Available Docker networks: ${netSummary}`);
-        // Check if our dedicated network already exists
-        const existing = networks.find((n) => n.Name === IpAliasManager.NETWORK_NAME);
-        if (existing) {
+        // 1. Exact-name match — our own network from a prior run
+        const byName = networks.find((n) => n.Name === IpAliasManager.NETWORK_NAME);
+        if (byName) {
             this.macvlanNetworkName = IpAliasManager.NETWORK_NAME;
-            this.console.log(`Using existing ${IpAliasManager.NETWORK_NAME} network (${existing.Driver})`);
+            this.networkOwnedByUs = true;
+            this.console.log(`Using existing ${IpAliasManager.NETWORK_NAME} network (${byName.Driver})`);
             return true;
         }
-        // Create a new macvlan network on the specified parent interface
+        // 2. Match by config — any macvlan on the same parent whose subnet contains our IP.
+        // Docker only allows one macvlan per parent interface, so a foreign network on
+        // our parent would block creation anyway. Reuse it when our IP fits.
+        for (const net of networks) {
+            if (net.Driver !== "macvlan")
+                continue;
+            let detail = null;
+            try {
+                detail = await this.dockerApiGet(`/networks/${net.Id}`);
+            }
+            catch {
+                continue;
+            }
+            if (detail?.Options?.parent !== parentIface)
+                continue;
+            const existingSubnet = detail?.IPAM?.Config?.[0]?.Subnet;
+            if (!existingSubnet)
+                continue;
+            if (IpAliasManager.ipInSubnet(ip, existingSubnet)) {
+                this.macvlanNetworkName = net.Name;
+                this.networkOwnedByUs = false;
+                this.console.log(`Reusing existing macvlan '${net.Name}' on ${parentIface} (${existingSubnet}) — IP ${ip} fits`);
+                return true;
+            }
+            this.console.error(`Macvlan '${net.Name}' already claims parent ${parentIface} with subnet ${existingSubnet}, ` +
+                `but assigned IP ${ip} is outside it. Either change the plugin's IP range to fall within ` +
+                `${existingSubnet}, or remove '${net.Name}' (docker network rm ${net.Name}) so this plugin ` +
+                `can create its own.`);
+            return false;
+        }
+        // 3. Create our own
         this.console.log(`Creating macvlan network '${IpAliasManager.NETWORK_NAME}' on ${parentIface} (${subnet})...`);
         const result = await this.dockerApiPost("/networks/create", {
             Name: IpAliasManager.NETWORK_NAME,
@@ -2564,12 +2615,14 @@ class IpAliasManager {
         });
         if (result?.Id || result?.id) {
             this.macvlanNetworkName = IpAliasManager.NETWORK_NAME;
+            this.networkOwnedByUs = true;
             this.console.log(`Created macvlan network on ${parentIface} (${subnet})`);
             return true;
         }
-        // Handle race condition: another camera already created it
+        // Race condition: another camera created it between our list and create
         if (result?.message?.includes("already exists")) {
             this.macvlanNetworkName = IpAliasManager.NETWORK_NAME;
+            this.networkOwnedByUs = true;
             this.console.log(`Network ${IpAliasManager.NETWORK_NAME} already created by another camera`);
             return true;
         }
@@ -2612,7 +2665,7 @@ class IpAliasManager {
             const subnet = `${(netNum >>> 24) & 0xff}.${(netNum >>> 16) & 0xff}.${(netNum >>> 8) & 0xff}.${netNum & 0xff}/${prefix}`;
             const gateway = gatewayOverride || `${ipParts[0]}.${ipParts[1]}.${ipParts[2]}.1`;
             // Ensure macvlan network exists on the specified parent interface
-            const netOk = await this.ensureMacvlanNetwork(parentIface, subnet, gateway);
+            const netOk = await this.ensureMacvlanNetwork(parentIface, subnet, gateway, ip);
             if (!netOk)
                 return false;
             // Ensure socat image is available
