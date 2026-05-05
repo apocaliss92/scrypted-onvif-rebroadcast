@@ -3,6 +3,10 @@ export interface RtspStreamInfo {
     rtspUrl: string;
     width?: number;
     height?: number;
+    videoCodec?: string;
+    audioCodec?: string;
+    audioSampleRate?: number;
+    audioChannels?: number;
 }
 
 export interface DeviceCapabilities {
