@@ -95,6 +95,17 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
         }
       },
     },
+    refreshStreams: {
+      title: "Refresh Streams",
+      description: "Re-discover RTSP rebroadcast streams from the Rebroadcast plugin. Use this after adding a new synthetic stream.",
+      type: "button",
+      onPut: async () => {
+        await this.discoverStreams();
+        if (this.storageSettings.values.serverEnabled) {
+          await this.startOnvifServer();
+        }
+      },
+    },
     debugEvents: {
       title: "Debug events",
       description:
@@ -142,8 +153,11 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
   }
 
   async getMixinSettings(): Promise<Setting[]> {
-    // Refresh stream choices so newly added synthetic streams appear in the dropdown
-    await this.discoverStreams();
+    // Update stream choices from the already-cached discoveredStreams without
+    // re-running full RPC discovery on every settings access — discovery runs
+    // at startup and on explicit refresh only to avoid heap accumulation from
+    // repeated cross-boundary proxy allocations.
+    this.updateStreamChoices();
 
     const settings = await this.storageSettings.getSettings();
 
