@@ -121,6 +121,19 @@ Each camera gets its own proxy container with:
 5. Enter each camera's assigned IP with port `8000`
 6. Enter the ONVIF username/password you configured
 
+### Audio in UniFi Protect
+
+UniFi Protect audio depends on the RTSP stream codec that Scrypted Rebroadcast serves. This plugin wraps those RTSP URLs in ONVIF and proxies them; it does not transcode audio itself.
+
+For third-party camera audio in Protect:
+
+1. In Scrypted's Rebroadcast settings for the camera, enable **Improved Compatibility Mode** on the stream you want UniFi to use.
+2. Reload or refresh this plugin so the updated rebroadcast stream is discovered.
+3. On the camera's ONVIF Rebroadcast mixin settings, set **Streams to expose via ONVIF** to the compatible main/sub streams.
+4. Remove and re-add the camera in UniFi Protect if it was already adopted; Protect caches stream/profile metadata.
+
+The plugin logs each discovered stream's audio codec. UniFi Protect is most reliable when the selected streams show AAC audio.
+
 ### Unraid Notes
 
 - If your Scrypted container uses `Custom: br0.2` (ipvlan), create the macvlan network on `br0` instead to get unique MACs

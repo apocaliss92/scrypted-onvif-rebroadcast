@@ -102,6 +102,19 @@ Repeat for each camera IP. Each will be recognized as a separate device with its
 
 > **Note:** UniFi will display the camera's actual model number (e.g. "Reolink CX410") as reported by the ONVIF device information.
 
+## UniFi Protect Audio
+
+The proxy only forwards Scrypted's RTSP rebroadcast stream. It cannot add or transcode audio after the fact.
+
+If UniFi Protect shows video but no audio:
+
+- Enable **Improved Compatibility Mode** in Scrypted's Rebroadcast settings for the camera stream.
+- In the ONVIF Rebroadcast mixin settings, click **Refresh streams**.
+- Select the compatible main/sub streams under **Streams to expose via ONVIF**.
+- Remove and re-add the camera in UniFi Protect so Protect re-reads the ONVIF profile and RTSP audio metadata.
+
+Check the ONVIF Rebroadcast logs after refresh. The selected streams should show AAC audio for best Protect compatibility.
+
 ## Step 5: Verify
 
 You can verify the proxy containers are running:

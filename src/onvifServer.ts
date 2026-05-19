@@ -711,6 +711,32 @@ export class OnvifServer {
 
   // ─── Media Service ───────────────────────────────────────────────
 
+  private getFirstAudioStream(): RtspStreamInfo | undefined {
+    return (
+      this.config.streams.find((stream) => stream.audioCodec) ??
+      this.config.streams[0]
+    );
+  }
+
+  private getAudioEncoding(stream?: RtspStreamInfo): string {
+    const codec = stream?.audioCodec ?? "";
+    if (/g711|pcma|pcmu|pcm_?alaw|pcm_?mulaw/i.test(codec)) return "G711";
+    if (/g726/i.test(codec)) return "G726";
+    return "AAC";
+  }
+
+  private getAudioSampleRate(stream?: RtspStreamInfo): number {
+    const sampleRate = stream?.audioSampleRate;
+    if (!sampleRate || !Number.isFinite(sampleRate)) return 16;
+    return sampleRate > 1000 ? Math.round(sampleRate / 1000) : sampleRate;
+  }
+
+  private getAudioChannels(stream?: RtspStreamInfo): number {
+    const channels = stream?.audioChannels;
+    if (!channels || !Number.isFinite(channels)) return 1;
+    return channels;
+  }
+
   private getProfiles(): string {
     const caps = this.config.capabilities;
     const profiles = this.config.streams.map((stream, idx) => {
@@ -729,9 +755,9 @@ export class OnvifServer {
         <tt:AudioEncoderConfiguration token="aenc_0">
           <tt:Name>AudioEncoder_0</tt:Name>
           <tt:UseCount>1</tt:UseCount>
-          <tt:Encoding>AAC</tt:Encoding>
+          <tt:Encoding>${this.getAudioEncoding(stream)}</tt:Encoding>
           <tt:Bitrate>64</tt:Bitrate>
-          <tt:SampleRate>16</tt:SampleRate>
+          <tt:SampleRate>${this.getAudioSampleRate(stream)}</tt:SampleRate>
         </tt:AudioEncoderConfiguration>`;
       }
 
@@ -900,7 +926,7 @@ export class OnvifServer {
     return soapEnvelope(`
     <trt:GetAudioSourcesResponse>
       <trt:AudioSources token="audio_src_0">
-        <tt:Channels>1</tt:Channels>
+        <tt:Channels>${this.getAudioChannels(this.getFirstAudioStream())}</tt:Channels>
       </trt:AudioSources>
     </trt:GetAudioSourcesResponse>`);
   }
@@ -932,9 +958,9 @@ export class OnvifServer {
       <trt:Configurations token="aenc_0">
         <tt:Name>AudioEncoder_0</tt:Name>
         <tt:UseCount>1</tt:UseCount>
-        <tt:Encoding>AAC</tt:Encoding>
+        <tt:Encoding>${this.getAudioEncoding(this.getFirstAudioStream())}</tt:Encoding>
         <tt:Bitrate>64</tt:Bitrate>
-        <tt:SampleRate>16</tt:SampleRate>
+        <tt:SampleRate>${this.getAudioSampleRate(this.getFirstAudioStream())}</tt:SampleRate>
       </trt:Configurations>
     </trt:GetAudioEncoderConfigurationsResponse>`);
   }

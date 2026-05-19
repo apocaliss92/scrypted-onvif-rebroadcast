@@ -519,9 +519,20 @@ export class IpAliasManager {
     if (rtspTargets && rtspTargets.length > 0) {
       // Run multiple socat instances: ONVIF + one per RTSP stream
       const socatCmds = [`socat TCP-LISTEN:8000,fork,reuseaddr TCP:${sanitizeHost(scryptedIp)}:${sanitizePort(proxyPort)}`];
+      const proxyListenPorts = rtspTargets.map((_, idx) => 554 + idx);
+      const fallbackRtspPort = rtspTargets.find((target) => !proxyListenPorts.includes(target.port))?.port;
       rtspTargets.forEach((target, idx) => {
         const listenPort = 554 + idx;
-        socatCmds.push(`socat TCP-LISTEN:${sanitizePort(listenPort)},fork,reuseaddr TCP:${sanitizeHost(scryptedIp)}:${sanitizePort(target.port)}`);
+        const targetPort = proxyListenPorts.includes(target.port) && fallbackRtspPort
+          ? fallbackRtspPort
+          : target.port;
+        if (targetPort !== target.port) {
+          this.console.warn(
+            `RTSP target ${target.host}:${target.port} looks like a proxy listener. ` +
+            `Forwarding ${listenPort} to Scrypted rebroadcast port ${targetPort} instead.`,
+          );
+        }
+        socatCmds.push(`socat TCP-LISTEN:${sanitizePort(listenPort)},fork,reuseaddr TCP:${sanitizeHost(scryptedIp)}:${sanitizePort(targetPort)}`);
       });
       cmd = ["-c", routePrefix + socatCmds.map((c) => `${c} &`).join(" ") + " wait"];
     } else {
