@@ -108,12 +108,12 @@ The proxy only forwards Scrypted's RTSP rebroadcast stream. It cannot add or tra
 
 If UniFi Protect shows video but no audio:
 
-- Enable **Improved Compatibility Mode** in Scrypted's Rebroadcast settings for the camera stream.
+- In Scrypted's Rebroadcast settings, try the available stream modes and keep the one that exposes stable audio in Protect. Some cameras work better with default rebroadcast audio than Improved Compatibility Mode.
 - In the ONVIF Rebroadcast mixin settings, click **Refresh streams**.
-- Select the compatible main/sub streams under **Streams to expose via ONVIF**.
+- Select the working main/sub streams under **Streams to expose via ONVIF**.
 - Remove and re-add the camera in UniFi Protect so Protect re-reads the ONVIF profile and RTSP audio metadata.
 
-Check the ONVIF Rebroadcast logs after refresh. The selected streams should show AAC audio for best Protect compatibility.
+Check the ONVIF Rebroadcast logs after refresh. The selected streams should show audio metadata so you can compare which mode Protect handles best.
 
 ## Step 5: Verify
 

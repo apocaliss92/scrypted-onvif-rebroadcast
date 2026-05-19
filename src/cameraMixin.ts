@@ -84,7 +84,7 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
     selectedStreams: {
       title: "Streams to expose via ONVIF",
       description:
-        "Select up to 2 RTSP streams to publish as ONVIF profiles. For UniFi Protect audio, select Scrypted Rebroadcast streams that have Improved Compatibility Mode enabled so audio is AAC.",
+        "Select up to 2 RTSP streams to publish as ONVIF profiles. For UniFi Protect audio, select the Scrypted Rebroadcast streams that expose stable audio for your camera.",
       type: "string",
       multiple: true,
       combobox: true,
@@ -292,7 +292,7 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
         );
         if (s.audioCodec && !/aac/i.test(s.audioCodec)) {
           this.console.warn(
-            `  - Stream "${s.name}" uses ${s.audioCodec} audio. UniFi Protect audio usually requires AAC; enable Improved Compatibility Mode in Scrypted Rebroadcast and select that stream here.`,
+            `  - Stream "${s.name}" uses ${s.audioCodec} audio. If UniFi Protect has no audio, try another Scrypted Rebroadcast mode and refresh streams here.`,
           );
         }
       }

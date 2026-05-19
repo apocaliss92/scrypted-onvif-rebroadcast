@@ -127,12 +127,12 @@ UniFi Protect audio depends on the RTSP stream codec that Scrypted Rebroadcast s
 
 For third-party camera audio in Protect:
 
-1. In Scrypted's Rebroadcast settings for the camera, enable **Improved Compatibility Mode** on the stream you want UniFi to use.
+1. In Scrypted's Rebroadcast settings for the camera, choose the stream mode that actually exposes working audio in Protect. Some cameras work better with default rebroadcast audio than Improved Compatibility Mode.
 2. Reload or refresh this plugin so the updated rebroadcast stream is discovered.
-3. On the camera's ONVIF Rebroadcast mixin settings, set **Streams to expose via ONVIF** to the compatible main/sub streams.
+3. On the camera's ONVIF Rebroadcast mixin settings, set **Streams to expose via ONVIF** to the working main/sub streams.
 4. Remove and re-add the camera in UniFi Protect if it was already adopted; Protect caches stream/profile metadata.
 
-The plugin logs each discovered stream's audio codec. UniFi Protect is most reliable when the selected streams show AAC audio.
+The plugin logs each discovered stream's audio codec so you can compare modes and select the stream that works best with Protect.
 
 ### Unraid Notes
 
