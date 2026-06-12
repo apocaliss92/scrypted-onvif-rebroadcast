@@ -38,6 +38,34 @@ function getLocalIp(): string {
   return "127.0.0.1";
 }
 
+/**
+ * Race a cross-boundary RPC call against a timeout so a camera that never
+ * responds (e.g. cloud/WebRTC devices like Arlo whose RTSP is generated on
+ * demand) cannot block mixin initialization forever. A hung await here would
+ * otherwise leave the ONVIF server unstarted and let pending RPC results
+ * accumulate until the plugin OOM-crashes.
+ */
+async function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  label: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`${label} timed out after ${ms}ms`)),
+      ms,
+    );
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+const RPC_TIMEOUT_MS = 20000;
+
 export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
   private plugin: OnvifRebroadcastPlugin;
   private logger: {
@@ -48,6 +76,7 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
   };
   private onvifServer: OnvifServer | null = null;
   private discoveredStreams: RtspStreamInfo[] = [];
+  private discoverInFlight: Promise<void> | null = null;
   private assignedPort: number = 0;
   private killed = false;
   private motionListener: EventListenerRegister | null = null;
@@ -143,12 +172,18 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
 
     this.console.log(`ONVIF Rebroadcast mixin initialized for ${this.name}`);
 
-    await this.discoverStreams();
+    try {
+      await this.discoverStreams();
 
-    if (this.killed) return;
+      if (this.killed) return;
 
-    if (this.storageSettings.values.serverEnabled) {
-      await this.startOnvifServer();
+      if (this.storageSettings.values.serverEnabled) {
+        await this.startOnvifServer();
+      }
+    } catch (e) {
+      this.console.error(
+        `ONVIF Rebroadcast init failed for ${this.name}: ${(e as Error).message}`,
+      );
     }
   }
 
@@ -196,8 +231,19 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
 
   /**
    * Discover RTSP rebroadcast streams from Scrypted for this camera.
+   * Concurrent calls (startup init, settings refresh, server restart) are
+   * de-duplicated onto a single in-flight run so we never fan out duplicate
+   * cross-boundary RPC calls that could pile up as pending results.
    */
-  private async discoverStreams() {
+  private discoverStreams(): Promise<void> {
+    if (this.discoverInFlight) return this.discoverInFlight;
+    this.discoverInFlight = this._discoverStreams().finally(() => {
+      this.discoverInFlight = null;
+    });
+    return this.discoverInFlight;
+  }
+
+  private async _discoverStreams() {
     this.discoveredStreams = [];
 
     try {
@@ -206,7 +252,11 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
       ) as unknown as Settings;
       if (!device?.getSettings) return;
 
-      const deviceSettings = await device.getSettings();
+      const deviceSettings = await withTimeout(
+        device.getSettings(),
+        RPC_TIMEOUT_MS,
+        `${this.name} getSettings`,
+      );
       const rtspSettings = deviceSettings.filter(
         (setting) => setting.title === "RTSP Rebroadcast Url",
       );
@@ -216,7 +266,11 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
       try {
         const videoDevice = systemManager.getDeviceById(this.id) as any;
         if (videoDevice?.getVideoStreamOptions) {
-          streamOptions = await videoDevice.getVideoStreamOptions();
+          streamOptions = await withTimeout(
+            videoDevice.getVideoStreamOptions(),
+            RPC_TIMEOUT_MS,
+            `${this.name} getVideoStreamOptions`,
+          );
         }
       } catch {
         /* ignore */
@@ -298,10 +352,15 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
         try {
           const cam = systemManager.getDeviceById(this.id) as unknown as Camera;
           if (cam?.takePicture) {
-            const mediaObject = await cam.takePicture();
-            const buffer = await mediaManager.convertMediaObjectToBuffer(
-              mediaObject,
-              "image/jpeg",
+            const mediaObject = await withTimeout(
+              cam.takePicture(),
+              RPC_TIMEOUT_MS,
+              `${this.name} takePicture`,
+            );
+            const buffer = await withTimeout(
+              mediaManager.convertMediaObjectToBuffer(mediaObject, "image/jpeg"),
+              RPC_TIMEOUT_MS,
+              `${this.name} convertMediaObjectToBuffer`,
             );
             // Parse JPEG SOF0 marker for resolution
             const res = this.parseJpegResolution(buffer);
