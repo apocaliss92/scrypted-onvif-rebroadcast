@@ -2373,7 +2373,9 @@ class OnvifRebroadcastCameraMixin extends settings_mixin_1.SettingsMixinDeviceBa
                     }
                 })
                     .filter((t) => t !== null);
-                const result = await this.plugin.ipAliasManager.addAlias(this.id, assignedIp, iface, prefix, gateway, rtspTargets);
+                const shimIp = this.plugin.storageSettings.values.macvlanShimIp ||
+                    undefined;
+                const result = await this.plugin.ipAliasManager.addAlias(this.id, assignedIp, iface, prefix, gateway, rtspTargets, shimIp);
                 if (result.ok && result.proxyPort) {
                     onvifIp = assignedIp;
                     proxyPort = result.proxyPort;
@@ -2544,6 +2546,10 @@ class IpAliasManager {
         this.networkCreated = false;
         this.nextProxyPort = 18000;
         this.initLock = null;
+        this.shimIp = null;
+        this.shimAttempted = false;
+        this.macvlanGateway = null;
+        this.bridgeConnection = undefined;
         this.macvlanNetworkName = null;
         this.networkOwnedByUs = false;
         this.console = console;
@@ -2635,6 +2641,160 @@ class IpAliasManager {
             this.console.debug?.(`Bridge network detection failed: ${e.message}`);
         }
         return null;
+    }
+    /**
+     * Returns true when Scrypted's IP is in the same subnet as the macvlan network,
+     * meaning macvlan-to-host kernel isolation will block proxy containers from
+     * reaching it. Covers native installs and Docker with host networking
+     * (--network=host), where Scrypted gets a LAN IP instead of a bridge IP.
+     */
+    needsMacvlanShim(scryptedIp, macvlanIp, prefix) {
+        const toNum = (ip) => ip.split(".").map(Number).reduce((acc, n) => ((acc << 8) | n) >>> 0, 0) >>> 0;
+        const mask = (~0 << (32 - prefix)) >>> 0;
+        return (toNum(scryptedIp) & mask) === (toNum(macvlanIp) & mask);
+    }
+    /**
+     * Create a macvlan shim interface on the host so macvlan proxy containers can
+     * reach Scrypted. When Scrypted runs natively (or with --network=host) its
+     * physical interface IP is unreachable from macvlan containers (the kernel
+     * drops macvlan→host traffic). A shim macvlan interface in bridge mode gives
+     * the host a presence on the macvlan subnet, breaking the isolation.
+     *
+     * The shim IP defaults to subnet base + 2 (overridable). Returns the shim IP
+     * on success, or null if creation failed.
+     */
+    async ensureMacvlanShim(parentIface, ip, prefix, override) {
+        if (this.shimIp !== null)
+            return this.shimIp;
+        // Only attempt creation once: a failed attempt falls through to the
+        // gateway-route strategy permanently instead of spawning a privileged
+        // helper container for every camera.
+        if (this.shimAttempted)
+            return null;
+        this.shimAttempted = true;
+        // parentIface is interpolated into a shell command run in a PRIVILEGED,
+        // host-networked helper container, so validate it strictly. prefix must be a
+        // usable subnet (a /31 or /32 leaves no room for a distinct shim address).
+        if (!/^[a-zA-Z0-9._:-]+$/.test(parentIface)) {
+            this.console.error(`Invalid network interface name for macvlan shim: ${parentIface}`);
+            return null;
+        }
+        if (!Number.isInteger(prefix) || prefix < 1 || prefix > 30) {
+            this.console.error(`Macvlan shim needs a subnet prefix between 1 and 30, got ${prefix}`);
+            return null;
+        }
+        let shimIp;
+        if (override) {
+            shimIp = override;
+        }
+        else {
+            const ipParts = ip.split(".").map(Number);
+            const ipNum = ((ipParts[0] << 24) | (ipParts[1] << 16) | (ipParts[2] << 8) | ipParts[3]) >>> 0;
+            const mask = (~0 << (32 - prefix)) >>> 0;
+            const shimNum = ((ipNum & mask) >>> 0) + 2;
+            shimIp = [
+                (shimNum >>> 24) & 0xff,
+                (shimNum >>> 16) & 0xff,
+                (shimNum >>> 8) & 0xff,
+                shimNum & 0xff,
+            ].join(".");
+        }
+        const iface = IpAliasManager.SHIM_IFACE;
+        // Existence check via os.networkInterfaces() — no 'ip' binary needed
+        if ((os_1.default.networkInterfaces()[iface] ?? []).some(a => a.family === "IPv4" && a.address === shimIp)) {
+            this.console.log(`Macvlan shim ${iface} already up at ${shimIp}`);
+            this.shimIp = shimIp;
+            return shimIp;
+        }
+        // Create via a temporary privileged container using the already-pulled
+        // alpine/socat image (busybox includes 'ip'), so this works even when the
+        // Scrypted image lacks iproute2.
+        const cmd = [
+            `ip link del ${iface} 2>/dev/null || true`,
+            `ip link add ${iface} link ${parentIface} type macvlan mode bridge`,
+            `ip addr add ${shimIp}/${prefix} dev ${iface}`,
+            `ip link set ${iface} up`,
+        ].join(" && ");
+        try {
+            await this.runPrivilegedCommand(cmd);
+        }
+        catch (e) {
+            const msg = (e.message ?? String(e)).split("\n")[0];
+            this.console.error(`Failed to create macvlan shim (${msg}). Run manually on the Scrypted host:\n` +
+                `  ip link add ${iface} link ${parentIface} type macvlan mode bridge && ` +
+                `ip addr add ${shimIp}/${prefix} dev ${iface} && ip link set ${iface} up`);
+            return null;
+        }
+        await new Promise(r => setTimeout(r, 500));
+        if ((os_1.default.networkInterfaces()[iface] ?? []).some(a => a.family === "IPv4" && a.address === shimIp)) {
+            this.shimIp = shimIp;
+            this.console.log(`Created macvlan shim ${iface} at ${shimIp}/${prefix} on ${parentIface} — ` +
+                `proxy containers will use this IP to reach Scrypted`);
+            return shimIp;
+        }
+        this.console.error(`Shim command ran but ${iface} not visible with IP ${shimIp} — check permissions or set the shim IP manually.`);
+        return null;
+    }
+    /**
+     * Run a shell command in a temporary privileged container sharing the host
+     * network namespace. Uses alpine/socat (already pulled) whose busybox
+     * includes the 'ip' command.
+     */
+    async runPrivilegedCommand(cmd) {
+        const createResult = await this.dockerApiPost("/containers/create", {
+            Image: "alpine/socat:latest",
+            Entrypoint: ["/bin/sh"],
+            Cmd: ["-c", cmd],
+            HostConfig: {
+                NetworkMode: "host",
+                Privileged: true,
+            },
+        });
+        if (!createResult?.Id) {
+            throw new Error(`Failed to create privileged helper container: ${JSON.stringify(createResult)}`);
+        }
+        const id = createResult.Id;
+        try {
+            await this.dockerApiPost(`/containers/${id}/start`, {});
+            const deadline = Date.now() + 15000;
+            while (Date.now() < deadline) {
+                await new Promise(r => setTimeout(r, 300));
+                const info = await this.dockerApiGet(`/containers/${id}/json`);
+                if (!info?.State?.Running) {
+                    if ((info?.State?.ExitCode ?? 0) !== 0) {
+                        throw new Error(`Privileged helper exited with code ${info?.State?.ExitCode}`);
+                    }
+                    return;
+                }
+            }
+            throw new Error("Privileged helper container timed out after 15 seconds");
+        }
+        finally {
+            await new Promise((resolve) => {
+                // Overall guard: resolve no matter what (even if the daemon stalls
+                // mid-response) so cleanup can never block subsequent addAlias calls.
+                const done = setTimeout(() => resolve(), DOCKER_API_TIMEOUT_MS);
+                done.unref?.();
+                const finish = () => { clearTimeout(done); resolve(); };
+                const req = http_1.default.request({ socketPath: DOCKER_SOCKET, path: `/containers/${id}?force=true`, method: "DELETE" }, (res) => { res.resume(); res.on("end", finish); res.on("error", finish); });
+                req.on("error", finish);
+                req.setTimeout(DOCKER_API_TIMEOUT_MS, finish);
+                req.end();
+            });
+        }
+    }
+    async removeShim() {
+        if (!this.shimIp)
+            return;
+        const iface = IpAliasManager.SHIM_IFACE;
+        try {
+            await this.runPrivilegedCommand(`ip link del ${iface} 2>/dev/null || true`);
+            this.console.log(`Removed macvlan shim ${iface}`);
+        }
+        catch {
+            // Best effort
+        }
+        this.shimIp = null;
     }
     /**
      * Allocate a unique port for the ONVIF server to listen on internally.
@@ -2760,7 +2920,7 @@ class IpAliasManager {
      * The container runs socat to forward port 8000 to the Scrypted container's
      * ONVIF server port.
      */
-    async addAlias(deviceId, ip, parentIface, prefix, gatewayOverride, rtspTargets) {
+    async addAlias(deviceId, ip, parentIface, prefix, gatewayOverride, rtspTargets, shimIpOverride) {
         if (!this.hasDockerSocket()) {
             this.console.error(`Docker socket not found at ${DOCKER_SOCKET}`);
             return { ok: false };
@@ -2790,59 +2950,109 @@ class IpAliasManager {
             const netNum = (ipNum & mask) >>> 0;
             const subnet = `${(netNum >>> 24) & 0xff}.${(netNum >>> 16) & 0xff}.${(netNum >>> 8) & 0xff}.${netNum & 0xff}/${prefix}`;
             const gateway = gatewayOverride || `${ipParts[0]}.${ipParts[1]}.${ipParts[2]}.1`;
+            this.macvlanGateway = gateway;
             // Ensure macvlan network exists on the specified parent interface
             const netOk = await this.ensureMacvlanNetwork(parentIface, subnet, gateway, ip);
             if (!netOk)
                 return false;
-            // Ensure socat image is available
+            // Ensure socat image is available (also used by the shim helper below)
             await this.ensureSocatImage();
+            // Detect once whether Scrypted is reachable via a Docker bridge. macvlan
+            // containers cannot reach the Docker host via its physical IP (kernel
+            // macvlan-to-host isolation); joining the same bridge bypasses that.
+            if (this.bridgeConnection === undefined) {
+                this.bridgeConnection = await this.findBridgeConnection();
+            }
+            // No bridge (native install or --network=host): if Scrypted's IP is on the
+            // macvlan subnet, create a host shim interface so proxies can reach it.
+            if (!this.bridgeConnection && this.needsMacvlanShim(this.getContainerIp(), ip, prefix)) {
+                await this.ensureMacvlanShim(parentIface, ip, prefix, shimIpOverride);
+            }
             return true;
         });
         if (!initOk)
             return { ok: false };
         // Allocate a unique internal port for the ONVIF server
         const proxyPort = this.allocateProxyPort();
-        // Prefer a Docker bridge IP over the physical host IP.
-        // macvlan containers cannot reach the Docker host via its physical IP due to
-        // Linux macvlan isolation — socat would connect to the host and get EHOSTUNREACH.
-        // Connecting the proxy to the same bridge network as Scrypted bypasses this.
-        const bridge = await this.findBridgeConnection();
-        const scryptedIp = bridge?.ip ?? this.getContainerIp();
-        if (!bridge) {
-            this.console.warn("Scrypted does not appear to be on a Docker bridge network. " +
-                "Falling back to host IP for socat forwarding — if ONVIF adoption fails, " +
-                "a macvlan shim interface on the host may be required.");
+        // Resolve the IP socat inside the proxy must target to reach Scrypted.
+        const bridge = this.bridgeConnection;
+        let scryptedIp = this.getContainerIp();
+        let needsGatewayRoute = false;
+        if (bridge) {
+            // Docker bridge mode: forward to Scrypted's bridge IP.
+            scryptedIp = bridge.ip;
+        }
+        else if (this.needsMacvlanShim(scryptedIp, ip, prefix)) {
+            if (this.shimIp) {
+                // Shim created — proxies reach Scrypted via the shim IP.
+                scryptedIp = this.shimIp;
+            }
+            else if (this.macvlanGateway) {
+                // Shim unavailable (e.g. VM hypervisor blocks macvlan-to-macvlan): add a
+                // host-specific route inside the proxy so traffic to Scrypted goes via
+                // the gateway instead of direct ARP, bypassing macvlan-to-host isolation.
+                needsGatewayRoute = true;
+                this.console.log(`Scrypted IP ${scryptedIp} is on the macvlan subnet and the shim is unavailable. ` +
+                    `Adding a gateway route (via ${this.macvlanGateway}) inside the proxy container.`);
+            }
+            else {
+                this.console.warn(`Scrypted IP ${scryptedIp} is on the macvlan subnet but no shim or gateway is available. ` +
+                    `Falling back to host IP for socat forwarding — ONVIF adoption may fail.`);
+            }
         }
         // Remove existing proxy container if any
         await this.removeProxyContainer(containerName);
-        // Build socat command: always proxy ONVIF (8000), optionally proxy RTSP (554+)
+        // Validate hostnames/ports to prevent shell injection
+        const sanitizeHost = (h) => {
+            if (!/^[a-zA-Z0-9._-]+$/.test(h))
+                throw new Error(`Invalid hostname: ${h}`);
+            return h;
+        };
+        const sanitizePort = (p) => {
+            if (!Number.isInteger(p) || p < 1 || p > 65535)
+                throw new Error(`Invalid port: ${p}`);
+            return p;
+        };
+        // When using the gateway-route fallback, prefix the sh command with the route
+        // setup. busybox 'ip' is available in alpine/socat; '|| true' keeps it
+        // idempotent across container restarts.
+        const routePrefix = needsGatewayRoute && this.macvlanGateway
+            ? `ip route add ${sanitizeHost(scryptedIp)}/32 via ${sanitizeHost(this.macvlanGateway)} 2>/dev/null || true && `
+            : "";
+        // Build socat command: always proxy ONVIF (8000), optionally proxy RTSP (554+).
+        // RTSP streams live on the same Scrypted host as ONVIF, so they are forwarded
+        // to scryptedIp (bridge/shim) too — the original target.host (Scrypted's
+        // physical IP) is unreachable from macvlan containers.
         let cmd;
-        let entrypoint;
+        const entrypoint = ["/bin/sh"];
         if (rtspTargets && rtspTargets.length > 0) {
-            // Run multiple socat instances: ONVIF + one per RTSP stream
-            // Validate hostnames/ports to prevent shell injection
-            const sanitizeHost = (h) => {
-                if (!/^[a-zA-Z0-9._-]+$/.test(h))
-                    throw new Error(`Invalid hostname: ${h}`);
-                return h;
-            };
-            const sanitizePort = (p) => {
-                if (!Number.isInteger(p) || p < 1 || p > 65535)
-                    throw new Error(`Invalid port: ${p}`);
-                return p;
-            };
             const socatCmds = [`socat TCP-LISTEN:8000,fork,reuseaddr TCP:${sanitizeHost(scryptedIp)}:${sanitizePort(proxyPort)}`];
             rtspTargets.forEach((target, idx) => {
                 const listenPort = 554 + idx;
-                socatCmds.push(`socat TCP-LISTEN:${sanitizePort(listenPort)},fork,reuseaddr TCP:${sanitizeHost(target.host)}:${sanitizePort(target.port)}`);
+                // Guard against a refreshed RTSP target whose port already equals this
+                // proxy's own listener port (554+idx) — forwarding it to scryptedIp on
+                // the same port would point the proxy at a dead/wrong endpoint. Borrow a
+                // sibling target's real rebroadcast port when one is available.
+                let targetPort = target.port;
+                if (target.port === listenPort) {
+                    const realPort = rtspTargets.find((t, i) => i !== idx && t.port !== 554 + i)?.port;
+                    if (realPort) {
+                        this.console.warn(`RTSP target ${target.host}:${target.port} matches this proxy's listener port. ` +
+                            `Forwarding ${listenPort} to Scrypted rebroadcast port ${realPort} instead.`);
+                        targetPort = realPort;
+                    }
+                    else {
+                        this.console.warn(`RTSP target ${target.host}:${target.port} matches this proxy's listener port ` +
+                            `and no alternative rebroadcast port is known — playback for this stream may fail. ` +
+                            `Refresh streams after the proxy is up to pick up the real rebroadcast URL.`);
+                    }
+                }
+                socatCmds.push(`socat TCP-LISTEN:${sanitizePort(listenPort)},fork,reuseaddr TCP:${sanitizeHost(scryptedIp)}:${sanitizePort(targetPort)}`);
             });
-            // Override entrypoint to use sh directly (alpine/socat prepends "socat" to Cmd)
-            entrypoint = ["/bin/sh"];
-            cmd = ["-c", socatCmds.map((c) => `${c} &`).join(" ") + " wait"];
+            cmd = ["-c", routePrefix + socatCmds.map((c) => `${c} &`).join(" ") + " wait"];
         }
         else {
-            cmd = [`TCP-LISTEN:8000,fork,reuseaddr`, `TCP:${scryptedIp}:${proxyPort}`];
-            entrypoint = undefined;
+            cmd = ["-c", `${routePrefix}socat TCP-LISTEN:8000,fork,reuseaddr TCP:${sanitizeHost(scryptedIp)}:${sanitizePort(proxyPort)}`];
         }
         // Create proxy container on our dedicated macvlan network with unique MAC.
         // The MAC must be set on the network endpoint (NetworkingConfig.EndpointsConfig):
@@ -2859,6 +3069,8 @@ class IpAliasManager {
             HostConfig: {
                 RestartPolicy: { Name: "unless-stopped" },
                 NetworkMode: this.macvlanNetworkName,
+                // NET_ADMIN is required to add the host-specific route at container startup
+                ...(needsGatewayRoute ? { CapAdd: ["NET_ADMIN"] } : {}),
             },
             NetworkingConfig: {
                 EndpointsConfig: {
@@ -2993,6 +3205,7 @@ class IpAliasManager {
         for (const id of [...this.activeProxies.keys()]) {
             await this.removeAlias(id);
         }
+        await this.removeShim();
     }
     // ─── Docker API helpers ─────────────────────────────────────────
     dockerApiGet(path) {
@@ -3048,6 +3261,7 @@ class IpAliasManager {
     }
 }
 exports.IpAliasManager = IpAliasManager;
+IpAliasManager.SHIM_IFACE = "macvlan-shim0";
 IpAliasManager.NETWORK_NAME = "onvif_cameras";
 
 
@@ -5317,6 +5531,15 @@ class OnvifRebroadcastPlugin extends sdk_1.ScryptedDeviceBase {
                 description: "Default gateway for the macvlan network (e.g. 192.168.1.1)",
                 type: "string",
                 placeholder: "192.168.1.1",
+                group: "IP Allocation",
+            },
+            macvlanShimIp: {
+                title: "Macvlan shim IP (native / host networking only)",
+                description: "IP for the macvlan shim interface created on the host when Scrypted runs natively or with --network=host and shares the camera subnet. " +
+                    "Must be in the same subnet as the IP range and unused by any other device or proxy. " +
+                    "Leave empty to auto-assign (subnet base + 2, e.g. 192.168.1.2 for a 192.168.1.0/24 network). Ignored in Docker bridge mode.",
+                type: "string",
+                placeholder: "192.168.1.2",
                 group: "IP Allocation",
             },
         });

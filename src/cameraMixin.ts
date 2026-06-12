@@ -585,6 +585,9 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
           })
           .filter((t): t is { host: string; port: number } => t !== null);
 
+        const shimIp =
+          (this.plugin.storageSettings.values.macvlanShimIp as string) ||
+          undefined;
         const result = await this.plugin.ipAliasManager.addAlias(
           this.id,
           assignedIp,
@@ -592,6 +595,7 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
           prefix,
           gateway,
           rtspTargets,
+          shimIp,
         );
         if (result.ok && result.proxyPort) {
           onvifIp = assignedIp;
