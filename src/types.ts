@@ -17,6 +17,8 @@ export interface DeviceCapabilities {
         zoom?: boolean;
     };
     hasIntercom: boolean;
+    /** True when the selected streams expose an audio track (advertise audio to the NVR). */
+    hasAudio: boolean;
     hasMotionSensor: boolean;
     hasAudioSensor: boolean;
     hasObjectDetection: boolean;

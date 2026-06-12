@@ -1982,6 +1982,7 @@ class OnvifRebroadcastCameraMixin extends settings_mixin_1.SettingsMixinDeviceBa
         this.onvifServer = null;
         this.discoveredStreams = [];
         this.discoverInFlight = null;
+        this.discoveredHasAudio = true;
         this.assignedPort = 0;
         this.killed = false;
         this.motionListener = null;
@@ -2172,6 +2173,13 @@ class OnvifRebroadcastCameraMixin extends settings_mixin_1.SettingsMixinDeviceBa
                     audioChannels,
                 });
             }
+            // Detect audio: only treat as silent if every stream option explicitly
+            // reports audio: null. Otherwise assume audio is present so the NVR records
+            // it — advertising an audio track that turns out silent is harmless, whereas
+            // never advertising audio means NVRs like UniFi Protect drop the track.
+            this.discoveredHasAudio =
+                streamOptions.length === 0 ||
+                    !streamOptions.every((s) => s?.audio === null);
             // Log stream option names for debugging resolution and codec matching
             if (streamOptions.length > 0) {
                 this.console.log(`${this.name}: stream options: ${streamOptions
@@ -2273,6 +2281,7 @@ class OnvifRebroadcastCameraMixin extends settings_mixin_1.SettingsMixinDeviceBa
         const capabilities = {
             hasPtz: has(sdk_1.ScryptedInterface.PanTiltZoom),
             hasIntercom: has(sdk_1.ScryptedInterface.Intercom),
+            hasAudio: this.discoveredHasAudio,
             hasMotionSensor: has(sdk_1.ScryptedInterface.MotionSensor),
             hasAudioSensor: has(sdk_1.ScryptedInterface.AudioSensor),
             hasObjectDetection: has(sdk_1.ScryptedInterface.ObjectDetector),
@@ -2294,7 +2303,7 @@ class OnvifRebroadcastCameraMixin extends settings_mixin_1.SettingsMixinDeviceBa
                 /* ignore */
             }
         }
-        this.logger.debug(`${this.name} capabilities: PTZ=${capabilities.hasPtz}, Intercom=${capabilities.hasIntercom}, Motion=${capabilities.hasMotionSensor}, Audio=${capabilities.hasAudioSensor}, ObjectDetect=${capabilities.hasObjectDetection}`);
+        this.logger.debug(`${this.name} capabilities: PTZ=${capabilities.hasPtz}, Intercom=${capabilities.hasIntercom}, Audio=${capabilities.hasAudio}, Motion=${capabilities.hasMotionSensor}, AudioSensor=${capabilities.hasAudioSensor}, ObjectDetect=${capabilities.hasObjectDetection}`);
         return capabilities;
     }
     /**
@@ -3646,7 +3655,7 @@ class OnvifServer {
         <tt:ScopeItem>onvif://www.onvif.org/type/ptz</tt:ScopeItem>
       </tds:Scopes>`;
         }
-        if (caps.hasIntercom) {
+        if (caps.hasAudio) {
             scopes += `
       <tds:Scopes>
         <tt:ScopeDef>Fixed</tt:ScopeDef>
@@ -3702,13 +3711,37 @@ class OnvifServer {
         return bytes.map((b) => b.toString(16).padStart(2, "0")).join(":");
     }
     // ─── Media Service ───────────────────────────────────────────────
+    getFirstAudioStream() {
+        return (this.config.streams.find((stream) => stream.audioCodec) ??
+            this.config.streams[0]);
+    }
+    getAudioEncoding(stream) {
+        const codec = stream?.audioCodec ?? "";
+        if (/g711|pcma|pcmu|pcm_?alaw|pcm_?mulaw/i.test(codec))
+            return "G711";
+        if (/g726/i.test(codec))
+            return "G726";
+        return "AAC";
+    }
+    getAudioSampleRate(stream) {
+        const sampleRate = stream?.audioSampleRate;
+        if (!sampleRate || !Number.isFinite(sampleRate))
+            return 16;
+        return sampleRate > 1000 ? Math.round(sampleRate / 1000) : sampleRate;
+    }
+    getAudioChannels(stream) {
+        const channels = stream?.audioChannels;
+        if (!channels || !Number.isFinite(channels))
+            return 1;
+        return channels;
+    }
     getProfiles() {
         const caps = this.config.capabilities;
         const profiles = this.config.streams.map((stream, idx) => {
             const token = `profile_${idx}`;
             let audioSourceXml = "";
             let audioEncoderXml = "";
-            if (caps.hasIntercom) {
+            if (caps.hasAudio) {
                 audioSourceXml = `
         <tt:AudioSourceConfiguration token="asrc_0">
           <tt:Name>AudioSource_0</tt:Name>
@@ -3719,9 +3752,9 @@ class OnvifServer {
         <tt:AudioEncoderConfiguration token="aenc_0">
           <tt:Name>AudioEncoder_0</tt:Name>
           <tt:UseCount>1</tt:UseCount>
-          <tt:Encoding>AAC</tt:Encoding>
+          <tt:Encoding>${this.getAudioEncoding(stream)}</tt:Encoding>
           <tt:Bitrate>64</tt:Bitrate>
-          <tt:SampleRate>16</tt:SampleRate>
+          <tt:SampleRate>${this.getAudioSampleRate(stream)}</tt:SampleRate>
         </tt:AudioEncoderConfiguration>`;
             }
             let audioOutputXml = "";
@@ -3860,19 +3893,19 @@ class OnvifServer {
     // ─── Audio Sources & Outputs ─────────────────────────────────────
     getAudioSources() {
         const caps = this.config.capabilities;
-        if (!caps.hasIntercom) {
+        if (!caps.hasAudio) {
             return soapEnvelope(`<trt:GetAudioSourcesResponse/>`);
         }
         return soapEnvelope(`
     <trt:GetAudioSourcesResponse>
       <trt:AudioSources token="audio_src_0">
-        <tt:Channels>1</tt:Channels>
+        <tt:Channels>${this.getAudioChannels(this.getFirstAudioStream())}</tt:Channels>
       </trt:AudioSources>
     </trt:GetAudioSourcesResponse>`);
     }
     getAudioSourceConfigurations() {
         const caps = this.config.capabilities;
-        if (!caps.hasIntercom) {
+        if (!caps.hasAudio) {
             return soapEnvelope(`<trt:GetAudioSourceConfigurationsResponse/>`);
         }
         return soapEnvelope(`
@@ -3886,7 +3919,7 @@ class OnvifServer {
     }
     getAudioEncoderConfigurations() {
         const caps = this.config.capabilities;
-        if (!caps.hasIntercom) {
+        if (!caps.hasAudio) {
             return soapEnvelope(`<trt:GetAudioEncoderConfigurationsResponse/>`);
         }
         return soapEnvelope(`
@@ -3894,9 +3927,9 @@ class OnvifServer {
       <trt:Configurations token="aenc_0">
         <tt:Name>AudioEncoder_0</tt:Name>
         <tt:UseCount>1</tt:UseCount>
-        <tt:Encoding>AAC</tt:Encoding>
+        <tt:Encoding>${this.getAudioEncoding(this.getFirstAudioStream())}</tt:Encoding>
         <tt:Bitrate>64</tt:Bitrate>
-        <tt:SampleRate>16</tt:SampleRate>
+        <tt:SampleRate>${this.getAudioSampleRate(this.getFirstAudioStream())}</tt:SampleRate>
       </trt:Configurations>
     </trt:GetAudioEncoderConfigurationsResponse>`);
     }
@@ -4395,7 +4428,7 @@ class OnvifServer {
         if (this.config.capabilities.hasPtz) {
             scopes.push("onvif://www.onvif.org/type/ptz");
         }
-        if (this.config.capabilities.hasIntercom) {
+        if (this.config.capabilities.hasAudio) {
             scopes.push("onvif://www.onvif.org/type/audio_encoder");
         }
         if (this.config.capabilities.hasIntercom) {
