@@ -401,7 +401,13 @@ export class IpAliasManager {
       entrypoint = undefined;
     }
 
-    // Create proxy container on our dedicated macvlan network with unique MAC
+    // Create proxy container on our dedicated macvlan network with unique MAC.
+    // The MAC must be set on the network endpoint (NetworkingConfig.EndpointsConfig):
+    // the top-level MacAddress field was deprecated in Docker API v1.44 (Docker 25)
+    // and is ignored for non-default networks attached this way, so newer Docker
+    // assigns a random MAC each time the container is recreated (UniFi Protect then
+    // sees a "new" camera). We keep the top-level value for older Docker daemons that
+    // predate per-endpoint MacAddress support.
     const containerConfig = {
       Image: "alpine/socat:latest",
       Entrypoint: entrypoint,
@@ -415,6 +421,7 @@ export class IpAliasManager {
         EndpointsConfig: {
           [this.macvlanNetworkName!]: {
             IPAMConfig: { IPv4Address: ip },
+            MacAddress: mac,
           },
         },
       },
