@@ -20,34 +20,32 @@ UniFi Protect identifies third-party cameras by MAC address. To add multiple cam
 
 - The **Rebroadcast plugin** installed in Scrypted
 - Docker installed and the Docker socket accessible at `/var/run/docker.sock`
-- A physical network interface available for macvlan (e.g. `eth0`, `ens3`, `br0`)
+- A parent network interface available for macvlan (e.g. `eth0`, `ens3`, `br0`)
 
-#### Scrypted in Docker (bridge networking — recommended)
+#### Scrypted in Docker (bridge networking - recommended)
 
-Mount the Docker socket and add the `NET_ADMIN` capability:
+Mount the Docker socket so the plugin can create and manage proxy containers:
 
 ```yaml
 # docker-compose.yml
 services:
   scrypted:
-    cap_add:
-      - NET_ADMIN
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
 ```
 
 Or with `docker run`:
 ```bash
-docker run --cap-add=NET_ADMIN -v /var/run/docker.sock:/var/run/docker.sock ...
+docker run -v /var/run/docker.sock:/var/run/docker.sock ...
 ```
 
-With bridge networking Scrypted gets a Docker bridge IP (e.g. `172.17.0.2`) which is in a different subnet from the macvlan cameras — no shim needed, everything routes through the host kernel automatically.
+With bridge networking, Scrypted gets a Docker bridge IP (e.g. `172.17.0.2`) in a different subnet from the macvlan cameras. The plugin detects that bridge network and connects each proxy container to it, so ONVIF and RTSP traffic can reach Scrypted without a host-side shim.
 
 #### Scrypted in Docker with `--network=host`, or native install
 
 When Scrypted shares the host network stack (host networking or bare-metal), it gets the same LAN IP as the host (e.g. `192.168.1.50`). Macvlan containers cannot reach that IP directly due to kernel macvlan-to-host isolation.
 
-The plugin detects this automatically (Scrypted's IP is in the same subnet as the macvlan network) and creates a `macvlan-shim0` interface on the host to bridge the gap. This requires `CAP_NET_ADMIN`.
+The plugin detects this automatically when Scrypted's IP is in the same subnet as the macvlan network and tries to create a `macvlan-shim0` interface on the host through a temporary privileged helper container. If your Docker setup does not allow privileged helper containers, create the shim manually with root or `CAP_NET_ADMIN`.
 
 **Docker with host networking:**
 ```yaml
@@ -58,7 +56,7 @@ volumes:
   - /var/run/docker.sock:/var/run/docker.sock
 ```
 
-**Native install:** Scrypted must run as root or with `CAP_NET_ADMIN` granted to the process.
+**Native install:** Docker must still be installed and `/var/run/docker.sock` must be accessible so the plugin can create proxy containers. Manual shim creation requires root or `CAP_NET_ADMIN` on the host.
 
 If automatic shim creation fails, check the plugin logs and run manually on the host:
 ```bash
@@ -67,7 +65,7 @@ ip addr add <shim-ip>/<prefix> dev macvlan-shim0
 ip link set macvlan-shim0 up
 ```
 
-Use the **Macvlan shim IP** plugin setting to control which IP is assigned (see settings table).
+Use the **Macvlan shim IP** plugin setting to control which IP is assigned. Leave it empty unless the auto-selected address conflicts with another device.
 
 ### Plugin Settings
 
@@ -79,7 +77,7 @@ Use the **Macvlan shim IP** plugin setting to control which IP is assigned (see 
 | **Network interface** | Parent interface for the macvlan Docker network | `eth0` |
 | **Subnet prefix length** | CIDR prefix for the macvlan network | `24` |
 | **Gateway** | Default gateway for the macvlan network | `192.168.1.1` |
-| **Macvlan shim IP** | *(Native host only)* IP for the host-side macvlan shim interface. Must be in the same subnet as the IP range and not in use. Leave empty to auto-assign (subnet base + 2). | `192.168.1.2` |
+| **Macvlan shim IP** | *(Native / host networking only)* IP for the host-side macvlan shim interface. Must be in the same subnet as the IP range and not in use. Leave empty to auto-assign (subnet base + 2). Ignored in Docker bridge mode. | `192.168.1.2` |
 
 ### IP Range Selection
 
@@ -92,8 +90,8 @@ Choose IPs **outside your DHCP pool** on the same subnet as your UniFi controlle
 UniFi Protect          macvlan proxy container       Scrypted container
 (192.168.1.x)          (192.168.1.240, unique MAC)   (172.17.0.2 / bridge)
      |                          |                            |
-     |-- ONVIF (port 8000) --->|-- TCP:18000 (bridge) ---->|  ONVIF server
-     |-- RTSP  (port 554)  --->|-- TCP:42917 (bridge) ---->|  RTSP rebroadcast
+     |-- ONVIF (port 8000) --->|-- TCP:18000 over bridge ->|  ONVIF server
+     |-- RTSP  (port 554)  --->|-- TCP:42917 over bridge ->|  RTSP rebroadcast
 ```
 
 **Scrypted on bare metal / VM:**
