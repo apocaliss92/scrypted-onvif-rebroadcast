@@ -227,9 +227,14 @@ export class IpAliasManager {
 
     const iface = IpAliasManager.SHIM_IFACE;
 
-    // Existence check via os.networkInterfaces() — no 'ip' binary needed
-    if ((os.networkInterfaces()[iface] ?? []).some(a => a.family === "IPv4" && a.address === shimIp)) {
-      this.console.log(`Macvlan shim ${iface} already up at ${shimIp}`);
+    // Existence check via os.networkInterfaces() — no 'ip' binary needed. Scan
+    // every interface (not just our own SHIM_IFACE) so a shim the user created
+    // manually under a different name is detected and reused instead of clashing.
+    const shimAlreadyUp = Object.values(os.networkInterfaces()).some(
+      (addrs) => (addrs ?? []).some(a => a.family === "IPv4" && a.address === shimIp),
+    );
+    if (shimAlreadyUp) {
+      this.console.log(`Macvlan shim IP ${shimIp} already present on the host — reusing it`);
       this.shimIp = shimIp;
       return shimIp;
     }
@@ -538,8 +543,11 @@ export class IpAliasManager {
 
       // No bridge (native install or --network=host): if Scrypted's IP is on the
       // macvlan subnet, create a host shim interface so proxies can reach it.
-      if (!this.bridgeConnection && this.needsMacvlanShim(this.getContainerIp(), ip, prefix)) {
-        await this.ensureMacvlanShim(parentIface, ip, prefix, shimIpOverride);
+      // Skipped when the user supplied an explicit shim/host IP override — they
+      // manage reachability themselves and we trust that IP directly as the socat
+      // target (see resolution below), so we must not try to recreate it.
+      if (!shimIpOverride && !this.bridgeConnection && this.needsMacvlanShim(this.getContainerIp(), ip, prefix)) {
+        await this.ensureMacvlanShim(parentIface, ip, prefix);
       }
 
       return true;
@@ -554,7 +562,13 @@ export class IpAliasManager {
     const bridge = this.bridgeConnection;
     let scryptedIp = this.getContainerIp();
     let needsGatewayRoute = false;
-    if (bridge) {
+    if (shimIpOverride) {
+      // Explicit host/shim IP override: the user tells us exactly where Scrypted
+      // is reachable from the macvlan subnet (e.g. a shim interface they manage).
+      // Trust it as the socat target directly, regardless of bridge/shim probing.
+      scryptedIp = shimIpOverride;
+      this.console.log(`Using configured Macvlan shim IP ${scryptedIp} as the socat forwarding target.`);
+    } else if (bridge) {
       // Docker bridge mode: forward to Scrypted's bridge IP.
       scryptedIp = bridge.ip;
     } else if (this.needsMacvlanShim(scryptedIp, ip, prefix)) {

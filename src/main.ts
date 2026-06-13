@@ -72,11 +72,11 @@ export default class OnvifRebroadcastPlugin
       group: "IP Allocation",
     },
     macvlanShimIp: {
-      title: "Macvlan shim IP (native / host networking only)",
+      title: "Macvlan shim / host IP override (native / host networking only)",
       description:
-        "IP for the macvlan shim interface created on the host when Scrypted runs natively or with --network=host and shares the camera subnet. " +
-        "Must be in the same subnet as the IP range and unused by any other device or proxy. " +
-        "Leave empty to auto-assign (subnet base + 2, e.g. 192.168.1.2 for a 192.168.1.0/24 network). Ignored in Docker bridge mode.",
+        "IP that macvlan proxy containers should use to reach Scrypted, for native or --network=host installs that share the camera subnet (where the host's primary IP is unreachable from macvlan containers). " +
+        "When set, this IP is used directly as the socat forwarding target — point it at a host shim interface you manage (or one the plugin created). " +
+        "Leave empty to let the plugin auto-create a shim at subnet base + 2 (e.g. 192.168.1.2 for 192.168.1.0/24). Ignored in Docker bridge mode.",
       type: "string",
       placeholder: "192.168.1.2",
       group: "IP Allocation",

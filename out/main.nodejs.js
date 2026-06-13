@@ -2700,9 +2700,12 @@ class IpAliasManager {
             ].join(".");
         }
         const iface = IpAliasManager.SHIM_IFACE;
-        // Existence check via os.networkInterfaces() — no 'ip' binary needed
-        if ((os_1.default.networkInterfaces()[iface] ?? []).some(a => a.family === "IPv4" && a.address === shimIp)) {
-            this.console.log(`Macvlan shim ${iface} already up at ${shimIp}`);
+        // Existence check via os.networkInterfaces() — no 'ip' binary needed. Scan
+        // every interface (not just our own SHIM_IFACE) so a shim the user created
+        // manually under a different name is detected and reused instead of clashing.
+        const shimAlreadyUp = Object.values(os_1.default.networkInterfaces()).some((addrs) => (addrs ?? []).some(a => a.family === "IPv4" && a.address === shimIp));
+        if (shimAlreadyUp) {
+            this.console.log(`Macvlan shim IP ${shimIp} already present on the host — reusing it`);
             this.shimIp = shimIp;
             return shimIp;
         }
@@ -2965,8 +2968,11 @@ class IpAliasManager {
             }
             // No bridge (native install or --network=host): if Scrypted's IP is on the
             // macvlan subnet, create a host shim interface so proxies can reach it.
-            if (!this.bridgeConnection && this.needsMacvlanShim(this.getContainerIp(), ip, prefix)) {
-                await this.ensureMacvlanShim(parentIface, ip, prefix, shimIpOverride);
+            // Skipped when the user supplied an explicit shim/host IP override — they
+            // manage reachability themselves and we trust that IP directly as the socat
+            // target (see resolution below), so we must not try to recreate it.
+            if (!shimIpOverride && !this.bridgeConnection && this.needsMacvlanShim(this.getContainerIp(), ip, prefix)) {
+                await this.ensureMacvlanShim(parentIface, ip, prefix);
             }
             return true;
         });
@@ -2978,7 +2984,14 @@ class IpAliasManager {
         const bridge = this.bridgeConnection;
         let scryptedIp = this.getContainerIp();
         let needsGatewayRoute = false;
-        if (bridge) {
+        if (shimIpOverride) {
+            // Explicit host/shim IP override: the user tells us exactly where Scrypted
+            // is reachable from the macvlan subnet (e.g. a shim interface they manage).
+            // Trust it as the socat target directly, regardless of bridge/shim probing.
+            scryptedIp = shimIpOverride;
+            this.console.log(`Using configured Macvlan shim IP ${scryptedIp} as the socat forwarding target.`);
+        }
+        else if (bridge) {
             // Docker bridge mode: forward to Scrypted's bridge IP.
             scryptedIp = bridge.ip;
         }
@@ -5534,10 +5547,10 @@ class OnvifRebroadcastPlugin extends sdk_1.ScryptedDeviceBase {
                 group: "IP Allocation",
             },
             macvlanShimIp: {
-                title: "Macvlan shim IP (native / host networking only)",
-                description: "IP for the macvlan shim interface created on the host when Scrypted runs natively or with --network=host and shares the camera subnet. " +
-                    "Must be in the same subnet as the IP range and unused by any other device or proxy. " +
-                    "Leave empty to auto-assign (subnet base + 2, e.g. 192.168.1.2 for a 192.168.1.0/24 network). Ignored in Docker bridge mode.",
+                title: "Macvlan shim / host IP override (native / host networking only)",
+                description: "IP that macvlan proxy containers should use to reach Scrypted, for native or --network=host installs that share the camera subnet (where the host's primary IP is unreachable from macvlan containers). " +
+                    "When set, this IP is used directly as the socat forwarding target — point it at a host shim interface you manage (or one the plugin created). " +
+                    "Leave empty to let the plugin auto-create a shim at subnet base + 2 (e.g. 192.168.1.2 for 192.168.1.0/24). Ignored in Docker bridge mode.",
                 type: "string",
                 placeholder: "192.168.1.2",
                 group: "IP Allocation",
