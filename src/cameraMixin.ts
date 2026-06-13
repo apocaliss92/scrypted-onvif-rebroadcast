@@ -38,6 +38,34 @@ function getLocalIp(): string {
   return "127.0.0.1";
 }
 
+/**
+ * Race a cross-boundary RPC call against a timeout so a camera that never
+ * responds (e.g. cloud/WebRTC devices like Arlo whose RTSP is generated on
+ * demand) cannot block mixin initialization forever. A hung await here would
+ * otherwise leave the ONVIF server unstarted and let pending RPC results
+ * accumulate until the plugin OOM-crashes.
+ */
+async function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  label: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`${label} timed out after ${ms}ms`)),
+      ms,
+    );
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+const RPC_TIMEOUT_MS = 20000;
+
 export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
   private plugin: OnvifRebroadcastPlugin;
   private logger: {
@@ -48,6 +76,7 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
   };
   private onvifServer: OnvifServer | null = null;
   private discoveredStreams: RtspStreamInfo[] = [];
+  private discoverInFlight: Promise<void> | null = null;
   private discoveredHasAudio = true;
   private assignedPort: number = 0;
   private killed = false;
@@ -84,7 +113,7 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
     selectedStreams: {
       title: "Streams to expose via ONVIF",
       description:
-        "Select up to 2 RTSP streams to publish as ONVIF profiles. For UniFi Protect audio, select the Scrypted Rebroadcast streams that expose stable audio for your camera.",
+        "Select up to 2 RTSP streams to publish as ONVIF profiles (main + substream). Synthetic streams created in the Rebroadcast plugin (e.g. with re-encoded audio for UniFi Protect) are listed here too. Leave empty to auto-pick the first two streams found.",
       type: "string",
       multiple: true,
       combobox: true,
@@ -97,9 +126,8 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
       },
     },
     refreshStreams: {
-      title: "Refresh streams",
-      description:
-        "Re-discover RTSP rebroadcast streams from Scrypted. Use this after changing Rebroadcast stream compatibility settings.",
+      title: "Refresh Streams",
+      description: "Re-discover RTSP rebroadcast streams from the Rebroadcast plugin. Use this after adding a new synthetic stream.",
       type: "button",
       onPut: async () => {
         await this.discoverStreams();
@@ -145,44 +173,54 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
 
     this.console.log(`ONVIF Rebroadcast mixin initialized for ${this.name}`);
 
-    await this.discoverStreams();
+    try {
+      await this.discoverStreams();
 
-    if (this.killed) return;
+      if (this.killed) return;
 
-    if (this.storageSettings.values.serverEnabled) {
-      await this.startOnvifServer();
+      if (this.storageSettings.values.serverEnabled) {
+        await this.startOnvifServer();
+      }
+    } catch (e) {
+      this.console.error(
+        `ONVIF Rebroadcast init failed for ${this.name}: ${(e as Error).message}`,
+      );
     }
   }
 
   async getMixinSettings(): Promise<Setting[]> {
+    // Update stream choices from the already-cached discoveredStreams without
+    // re-running full RPC discovery on every settings access — discovery runs
+    // at startup and on explicit refresh only to avoid heap accumulation from
+    // repeated cross-boundary proxy allocations.
     this.updateStreamChoices();
 
     const settings = await this.storageSettings.getSettings();
 
     if (this.assignedPort && this.onvifServer?.isRunning) {
-      const displayIp = (this.storageSettings.values.onvifIp as string) || getLocalIp();
+      const displayIp =
+        (this.storageSettings.values.onvifIp as string) || getLocalIp();
       const baseUrl = `http://${displayIp}:${this.assignedPort}/onvif`;
 
       settings.push({
-        key: 'deviceServiceUrl',
-        title: 'ONVIF Device Service Url',
+        key: "deviceServiceUrl",
+        title: "ONVIF Device Service Url",
         description: `${baseUrl}/device_service`,
         value: `${baseUrl}/device_service`,
-        type: 'string',
+        type: "string",
         readonly: true,
-        subgroup: 'Service URLs',
+        subgroup: "Service URLs",
       });
 
       settings.push({
-        key: 'mediaServiceUrl',
-        title: 'ONVIF Media Service Url',
+        key: "mediaServiceUrl",
+        title: "ONVIF Media Service Url",
         description: `${baseUrl}/media_service`,
         value: `${baseUrl}/media_service`,
-        type: 'string',
+        type: "string",
         readonly: true,
-        subgroup: 'Service URLs',
+        subgroup: "Service URLs",
       });
-
     }
 
     return settings;
@@ -194,8 +232,19 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
 
   /**
    * Discover RTSP rebroadcast streams from Scrypted for this camera.
+   * Concurrent calls (startup init, settings refresh, server restart) are
+   * de-duplicated onto a single in-flight run so we never fan out duplicate
+   * cross-boundary RPC calls that could pile up as pending results.
    */
-  private async discoverStreams() {
+  private discoverStreams(): Promise<void> {
+    if (this.discoverInFlight) return this.discoverInFlight;
+    this.discoverInFlight = this._discoverStreams().finally(() => {
+      this.discoverInFlight = null;
+    });
+    return this.discoverInFlight;
+  }
+
+  private async _discoverStreams() {
     this.discoveredStreams = [];
 
     try {
@@ -204,7 +253,11 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
       ) as unknown as Settings;
       if (!device?.getSettings) return;
 
-      const deviceSettings = await device.getSettings();
+      const deviceSettings = await withTimeout(
+        device.getSettings(),
+        RPC_TIMEOUT_MS,
+        `${this.name} getSettings`,
+      );
       const rtspSettings = deviceSettings.filter(
         (setting) => setting.title === "RTSP Rebroadcast Url",
       );
@@ -214,7 +267,11 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
       try {
         const videoDevice = systemManager.getDeviceById(this.id) as any;
         if (videoDevice?.getVideoStreamOptions) {
-          streamOptions = await videoDevice.getVideoStreamOptions();
+          streamOptions = await withTimeout(
+            videoDevice.getVideoStreamOptions(),
+            RPC_TIMEOUT_MS,
+            `${this.name} getVideoStreamOptions`,
+          );
         }
       } catch {
         /* ignore */
@@ -261,10 +318,9 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
       }
 
       // Detect audio: only treat as silent if every stream option explicitly
-      // reports audio: null. Otherwise assume audio is present so the NVR
-      // records it (advertising an audio track that turns out silent is
-      // harmless; the previous behavior of never advertising audio meant
-      // NVRs like UniFi Protect dropped the audio track entirely).
+      // reports audio: null. Otherwise assume audio is present so the NVR records
+      // it — advertising an audio track that turns out silent is harmless, whereas
+      // never advertising audio means NVRs like UniFi Protect drop the track.
       this.discoveredHasAudio =
         streamOptions.length === 0 ||
         !streamOptions.every((s: any) => s?.audio === null);
@@ -290,24 +346,37 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
         this.console.log(
           `  - ${s.name}: ${this.sanitizeUrl(s.rtspUrl)} | video=${s.videoCodec ?? "?"} ${s.width ?? "?"}x${s.height ?? "?"} | audio=${s.audioCodec ?? "?"} ${s.audioSampleRate ?? "?"}Hz ${s.audioChannels ?? "?"}ch`,
         );
-        if (s.audioCodec && !/aac/i.test(s.audioCodec)) {
+        if (s.audioCodec && /pcm_?alaw|pcm_?mulaw|g711/i.test(s.audioCodec)) {
           this.console.warn(
-            `  - Stream "${s.name}" uses ${s.audioCodec} audio. If UniFi Protect has no audio, try another Scrypted Rebroadcast mode and refresh streams here.`,
+            `  ⚠ Stream "${s.name}" uses ${s.audioCodec} audio — UniFi Protect may not record audio reliably. Create a synthetic stream in the Rebroadcast plugin with audio re-encoded to AAC and select it under "Streams to expose via ONVIF".`,
           );
         }
       }
 
       // If main stream still has no resolution, try probing via snapshot
-      if (this.discoveredStreams.length > 0 && !this.discoveredStreams[0].width) {
+      if (
+        this.discoveredStreams.length > 0 &&
+        !this.discoveredStreams[0].width
+      ) {
         try {
           const cam = systemManager.getDeviceById(this.id) as unknown as Camera;
           if (cam?.takePicture) {
-            const mediaObject = await cam.takePicture();
-            const buffer = await mediaManager.convertMediaObjectToBuffer(mediaObject, "image/jpeg");
+            const mediaObject = await withTimeout(
+              cam.takePicture(),
+              RPC_TIMEOUT_MS,
+              `${this.name} takePicture`,
+            );
+            const buffer = await withTimeout(
+              mediaManager.convertMediaObjectToBuffer(mediaObject, "image/jpeg"),
+              RPC_TIMEOUT_MS,
+              `${this.name} convertMediaObjectToBuffer`,
+            );
             // Parse JPEG SOF0 marker for resolution
             const res = this.parseJpegResolution(buffer);
             if (res) {
-              this.console.log(`${this.name}: detected resolution from snapshot: ${res.width}x${res.height}`);
+              this.console.log(
+                `${this.name}: detected resolution from snapshot: ${res.width}x${res.height}`,
+              );
               // Apply to all streams that lack resolution (main gets full res, others assumed same)
               for (const s of this.discoveredStreams) {
                 if (!s.width) {
@@ -318,7 +387,9 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
             }
           }
         } catch (e) {
-          this.console.warn(`${this.name}: snapshot resolution probe failed: ${(e as Error).message}`);
+          this.console.warn(
+            `${this.name}: snapshot resolution probe failed: ${(e as Error).message}`,
+          );
         }
       }
     } catch (e) {
@@ -345,10 +416,15 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
   }
 
   /** Parse JPEG SOF0/SOF2 marker to extract width and height */
-  private parseJpegResolution(buf: Buffer): { width: number; height: number } | null {
+  private parseJpegResolution(
+    buf: Buffer,
+  ): { width: number; height: number } | null {
     let offset = 0;
     while (offset < buf.length - 1) {
-      if (buf[offset] !== 0xff) { offset++; continue; }
+      if (buf[offset] !== 0xff) {
+        offset++;
+        continue;
+      }
       const marker = buf[offset + 1];
       // SOF0 (0xC0) or SOF2 (0xC2) — baseline or progressive
       if (marker === 0xc0 || marker === 0xc2) {
@@ -359,7 +435,10 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
         }
         return null;
       }
-      if (marker === 0xd8 || marker === 0xd9) { offset += 2; continue; } // SOI/EOI
+      if (marker === 0xd8 || marker === 0xd9) {
+        offset += 2;
+        continue;
+      } // SOI/EOI
       if (offset + 3 < buf.length) {
         const len = buf.readUInt16BE(offset + 2);
         offset += 2 + len;
@@ -435,6 +514,9 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
       return;
     }
 
+    // Apply user stream selection. ONVIF/UniFi Protect supports at most 2 profiles
+    // (main + substream), so cap selection at 2. When nothing is selected, fall
+    // back to the first 2 discovered streams to preserve existing behavior.
     const selected =
       (this.storageSettings.values.selectedStreams as string[] | undefined) ??
       [];
@@ -455,13 +537,16 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
       streamsToExpose = this.discoveredStreams.slice(0, 2);
     }
 
+    // Log what we're about to expose. Since this plugin only wraps RTSP in ONVIF
+    // (no transcoding), the output codecs are identical to the input — the log
+    // makes that explicit so users can verify their synthetic-stream choice.
     this.console.log(
-      `${this.name}: exposing ${streamsToExpose.length} ONVIF profile(s) from Scrypted RTSP passthrough:`,
+      `${this.name}: exposing ${streamsToExpose.length} ONVIF profile(s) (passthrough — input codec == output codec):`,
     );
     streamsToExpose.forEach((s, idx) => {
       const role = idx === 0 ? "MainStream" : "SubStream";
       this.console.log(
-        `  [${role}] "${s.name}" -> video=${s.videoCodec ?? "?"} ${s.width ?? "?"}x${s.height ?? "?"} | audio=${s.audioCodec ?? "?"} ${s.audioSampleRate ?? "?"}Hz ${s.audioChannels ?? "?"}ch`,
+        `  [${role}] "${s.name}" → video: ${s.videoCodec ?? "?"} ${s.width ?? "?"}x${s.height ?? "?"} | audio: ${s.audioCodec ?? "?"} ${s.audioSampleRate ?? "?"}Hz ${s.audioChannels ?? "?"}ch`,
       );
     });
 
@@ -476,24 +561,42 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
         const iface =
           (this.plugin.storageSettings.values.networkInterface as string) ||
           "br0";
-        const prefix = (this.plugin.storageSettings.values.subnetPrefix as number) || 23;
-        const gateway = (this.plugin.storageSettings.values.gateway as string) || undefined;
+        const prefix =
+          (this.plugin.storageSettings.values.subnetPrefix as number) || 23;
+        const gateway =
+          (this.plugin.storageSettings.values.gateway as string) || undefined;
 
         const cameraIndex = this.plugin.getStableIpIndex(this.id);
-        const assignedIp = IpAliasManager.computeIp(baseIp, cameraIndex, prefix);
+        const assignedIp = IpAliasManager.computeIp(
+          baseIp,
+          cameraIndex,
+          prefix,
+        );
 
-        // Extract RTSP targets from discovered streams for proxying
+        // Extract RTSP targets from exposed streams for proxying
         const rtspTargets = streamsToExpose
           .map((s) => {
             try {
               const url = new URL(s.rtspUrl);
               return { host: url.hostname, port: parseInt(url.port) || 554 };
-            } catch { return null; }
+            } catch {
+              return null;
+            }
           })
           .filter((t): t is { host: string; port: number } => t !== null);
 
-        const shimIp = (this.plugin.storageSettings.values.macvlanShimIp as string) || undefined;
-        const result = await this.plugin.ipAliasManager.addAlias(this.id, assignedIp, iface, prefix, gateway, rtspTargets, shimIp);
+        const shimIp =
+          (this.plugin.storageSettings.values.macvlanShimIp as string) ||
+          undefined;
+        const result = await this.plugin.ipAliasManager.addAlias(
+          this.id,
+          assignedIp,
+          iface,
+          prefix,
+          gateway,
+          rtspTargets,
+          shimIp,
+        );
         if (result.ok && result.proxyPort) {
           onvifIp = assignedIp;
           proxyPort = result.proxyPort;
@@ -509,7 +612,9 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
             } catch {}
           });
 
-          this.console.log(`Auto-assigned IP ${assignedIp} to ${this.name} (proxy port ${proxyPort})`);
+          this.console.log(
+            `Auto-assigned IP ${assignedIp} to ${this.name} (proxy port ${proxyPort})`,
+          );
         } else {
           this.console.warn(
             `Failed to auto-assign IP ${assignedIp} for ${this.name}. Falling back to shared IP.`,
@@ -525,7 +630,9 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
     // When using proxy containers, the ONVIF server listens on the proxy port
     // on the container's main IP, and the proxy container forwards port 8000 to it.
     // When not using proxies, use port 8000 if we have a unique IP, otherwise auto-assign.
-    const port = proxyPort || (onvifIp ? 8000 : ((this.storageSettings.values.onvifPort as number) || 0));
+    const port =
+      proxyPort ||
+      (onvifIp ? 8000 : (this.storageSettings.values.onvifPort as number) || 0);
 
     const username = this.plugin.storageSettings.values.username as string;
     const password = this.plugin.storageSettings.values.password as string;
@@ -537,7 +644,7 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
     const deviceInfo = device?.info;
 
     const config: OnvifServiceConfig = {
-      deviceName: device?.name || this.name,
+      deviceName: device?.name || this.name || '',
       deviceId: this.id,
       manufacturer: deviceInfo?.manufacturer || "Unknown",
       model: deviceInfo?.model || "Unknown",
@@ -553,9 +660,13 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
       capabilities,
       getSnapshot: async () => {
         const cam = systemManager.getDeviceById(this.id) as unknown as Camera;
-        if (!cam?.takePicture) throw new Error("Camera does not support snapshots");
+        if (!cam?.takePicture)
+          throw new Error("Camera does not support snapshots");
         const mediaObject = await cam.takePicture();
-        return mediaManager.convertMediaObjectToBuffer(mediaObject, "image/jpeg");
+        return mediaManager.convertMediaObjectToBuffer(
+          mediaObject,
+          "image/jpeg",
+        );
       },
     };
 

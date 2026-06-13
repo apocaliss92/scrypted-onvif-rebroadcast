@@ -24,7 +24,6 @@ interface DockerContainerState {
 interface DockerContainerNetworkSettings {
   IPAddress?: string;
   MacAddress?: string;
-  NetworkID?: string;
 }
 
 interface DockerContainerInfo {
@@ -41,6 +40,15 @@ interface DockerCreateResponse {
   message?: string;
 }
 
+interface DockerNetworkDetail {
+  Name: string;
+  Driver: string;
+  Options?: Record<string, string>;
+  IPAM?: {
+    Config?: Array<{ Subnet?: string; Gateway?: string }>;
+  };
+}
+
 export class IpAliasManager {
   private console: Console;
   private activeProxies: Map<string, { ip: string; mac: string; containerId: string; proxyPort: number }> = new Map();
@@ -49,7 +57,9 @@ export class IpAliasManager {
   private nextProxyPort = 18000;
   private initLock: Promise<void> | null = null;
   private shimIp: string | null = null;
-  private bridgeConnection: { networkId: string; networkName: string; containerIp: string } | null | undefined = undefined;
+  private shimAttempted = false;
+  private macvlanGateway: string | null = null;
+  private bridgeConnection: { network: string; ip: string } | null | undefined = undefined;
   private static readonly SHIM_IFACE = "macvlan-shim0";
 
   constructor(console: Console) {
@@ -95,161 +105,6 @@ export class IpAliasManager {
     return name.replace(/[^a-zA-Z0-9_.-]/g, "_");
   }
 
-  /**
-   * Returns true when Scrypted's IP is in the same subnet as the macvlan network,
-   * meaning macvlan-to-host kernel isolation will block proxy containers from reaching it.
-   *
-   * This covers both native installs and Docker with host networking (--network=host),
-   * where Scrypted gets a LAN IP instead of a Docker bridge IP (172.x.x.x).
-   * Docker bridge networking is unaffected — bridge IPs are in a different subnet.
-   */
-  private needsMacvlanShim(scryptedIp: string, macvlanIp: string, prefix: number): boolean {
-    const toNum = (ip: string) =>
-      ip.split(".").map(Number).reduce((acc, n) => ((acc << 8) | n) >>> 0, 0) >>> 0;
-    const mask = (~0 << (32 - prefix)) >>> 0;
-    return (toNum(scryptedIp) & mask) === (toNum(macvlanIp) & mask);
-  }
-
-  /**
-   * Create a macvlan shim interface on the host so macvlan proxy containers can reach Scrypted.
-   *
-   * When Scrypted runs natively, its physical interface IP is unreachable from macvlan containers
-   * (kernel drops macvlan→host traffic at the interface level). A shim macvlan interface gives
-   * the host itself a presence on the macvlan subnet, breaking the isolation.
-   *
-   * The shim IP is the subnet base address + 2 (e.g. 192.168.69.2 for a 192.168.69.0/24 subnet).
-   * Returns the shim IP on success, or null if creation failed.
-   */
-  private async ensureMacvlanShim(parentIface: string, ip: string, prefix: number, override?: string): Promise<string | null> {
-    if (this.shimIp !== null) return this.shimIp;
-
-    let shimIp: string;
-    if (override) {
-      shimIp = override;
-    } else {
-      const ipParts = ip.split(".").map(Number);
-      const ipNum = ((ipParts[0] << 24) | (ipParts[1] << 16) | (ipParts[2] << 8) | ipParts[3]) >>> 0;
-      const mask = (~0 << (32 - prefix)) >>> 0;
-      const netNum = (ipNum & mask) >>> 0;
-      const shimNum = netNum + 2;
-      shimIp = [
-        (shimNum >>> 24) & 0xff,
-        (shimNum >>> 16) & 0xff,
-        (shimNum >>> 8) & 0xff,
-        shimNum & 0xff,
-      ].join(".");
-    }
-
-    const iface = IpAliasManager.SHIM_IFACE;
-
-    // Check if already exists via os.networkInterfaces() — no 'ip' binary needed
-    if ((os.networkInterfaces()[iface] ?? []).some(a => a.family === "IPv4" && a.address === shimIp)) {
-      this.console.log(`Macvlan shim ${iface} already up at ${shimIp}`);
-      this.shimIp = shimIp;
-      return shimIp;
-    }
-
-    // Create via a temporary privileged container using the already-pulled alpine/socat image.
-    // Alpine's busybox includes 'ip', so this works even when the Scrypted image lacks iproute2.
-    const cmd = [
-      `ip link del ${iface} 2>/dev/null || true`,
-      `ip link add ${iface} link ${parentIface} type macvlan mode bridge`,
-      `ip addr add ${shimIp}/${prefix} dev ${iface}`,
-      `ip link set ${iface} up`,
-    ].join(" && ");
-
-    try {
-      await this.runPrivilegedCommand(cmd);
-    } catch (e: unknown) {
-      const msg = ((e as Error).message ?? String(e)).split("\n")[0];
-      this.console.error(
-        `Failed to create macvlan shim (${msg}). ` +
-        `Run manually on the Scrypted host:\n` +
-        `  ip link add ${iface} link ${parentIface} type macvlan mode bridge && ` +
-        `ip addr add ${shimIp}/${prefix} dev ${iface} && ` +
-        `ip link set ${iface} up`,
-      );
-      return null;
-    }
-
-    // Verify via os.networkInterfaces()
-    await new Promise(r => setTimeout(r, 500));
-    if ((os.networkInterfaces()[iface] ?? []).some(a => a.family === "IPv4" && a.address === shimIp)) {
-      this.shimIp = shimIp;
-      this.console.log(
-        `Created macvlan shim ${iface} at ${shimIp}/${prefix} on ${parentIface} — ` +
-        `proxy containers will use this IP to reach Scrypted`,
-      );
-      return shimIp;
-    }
-
-    this.console.error(
-      `Shim command ran but ${iface} not visible with IP ${shimIp} — check permissions or set the shim IP manually.`,
-    );
-    return null;
-  }
-
-  /**
-   * Run a shell command in a temporary privileged container sharing the host network namespace.
-   * Uses alpine/socat (already pulled) whose busybox includes the 'ip' command.
-   */
-  private async runPrivilegedCommand(cmd: string): Promise<void> {
-    const createResult = await this.dockerApiPost<DockerCreateResponse>("/containers/create", {
-      Image: "alpine/socat:latest",
-      Entrypoint: ["/bin/sh"],
-      Cmd: ["-c", cmd],
-      HostConfig: {
-        NetworkMode: "host",
-        Privileged: true,
-      },
-    });
-
-    if (!createResult?.Id) {
-      throw new Error(`Failed to create privileged helper container: ${JSON.stringify(createResult)}`);
-    }
-
-    const id = createResult.Id;
-    try {
-      await this.dockerApiPost(`/containers/${id}/start`, {});
-
-      // Poll until the container exits (max 15 seconds)
-      const deadline = Date.now() + 15000;
-      while (Date.now() < deadline) {
-        await new Promise(r => setTimeout(r, 300));
-        const info = await this.dockerApiGet<DockerContainerInfo>(`/containers/${id}/json`);
-        if (!info?.State?.Running) {
-          if ((info?.State?.ExitCode ?? 0) !== 0) {
-            throw new Error(`Privileged helper exited with code ${info?.State?.ExitCode}`);
-          }
-          return;
-        }
-      }
-      throw new Error("Privileged helper container timed out after 15 seconds");
-    } finally {
-      await new Promise<void>((resolve) => {
-        const req = http.request(
-          { socketPath: DOCKER_SOCKET, path: `/containers/${id}?force=true`, method: "DELETE" },
-          (res) => { res.resume(); res.on("end", () => resolve()); },
-        );
-        req.on("error", () => resolve());
-        req.setTimeout(DOCKER_API_TIMEOUT_MS, () => resolve());
-        req.end();
-      });
-    }
-  }
-
-  private async removeShim(): Promise<void> {
-    if (!this.shimIp) return;
-    const iface = IpAliasManager.SHIM_IFACE;
-    try {
-      await this.runPrivilegedCommand(`ip link del ${iface} 2>/dev/null || true`);
-      this.console.log(`Removed macvlan shim ${iface}`);
-    } catch {
-      // Best effort
-    }
-    this.shimIp = null;
-  }
-
   private hasDockerSocket(): boolean {
     if (this.dockerAvailable !== null) return this.dockerAvailable;
     this.dockerAvailable = fs.existsSync(DOCKER_SOCKET);
@@ -273,42 +128,214 @@ export class IpAliasManager {
   }
 
   /**
-   * Detect the Docker bridge network Scrypted's own container is attached to.
-   * When found, proxy containers can be connected to that bridge and reach
-   * Scrypted via its bridge IP — no shim or privileged operations needed.
-   * Returns null when not running in Docker or no bridge network is found.
+   * Find a Docker bridge network that Scrypted itself is connected to, and
+   * return our IP on it. macvlan proxy containers will also join this bridge
+   * so they can forward traffic to Scrypted without hitting the macvlan-to-host
+   * isolation wall (Linux macvlan containers cannot reach the host's physical IP).
    */
-  private async findBridgeConnection(): Promise<{ networkId: string; networkName: string; containerIp: string } | null> {
-    if (!this.hasDockerSocket()) return null;
-
-    let selfId: string;
+  private async findBridgeConnection(): Promise<{ network: string; ip: string } | null> {
     try {
-      selfId = fs.readFileSync("/etc/hostname", "utf8").trim();
-    } catch {
-      return null;
-    }
-    if (!selfId) return null;
-
-    try {
-      const info = await this.dockerApiGet<DockerContainerInfo>(`/containers/${selfId}/json`);
-      const nets = info?.NetworkSettings?.Networks;
-      if (!nets) return null;
-
-      const allNetworks = (await this.dockerApiGet<DockerNetwork[]>("/networks")) || [];
-      const bridgeIds = new Set(allNetworks.filter((n) => n.Driver === "bridge").map((n) => n.Id));
-
-      for (const [name, net] of Object.entries(nets)) {
-        if (net.NetworkID && bridgeIds.has(net.NetworkID) && net.IPAddress) {
-          this.console.log(
-            `Detected Docker bridge '${name}' at ${net.IPAddress} — proxy containers will connect via bridge to reach Scrypted`,
-          );
-          return { networkId: net.NetworkID, networkName: name, containerIp: net.IPAddress };
+      // Collect all our own IPs so we can identify which container is "us"
+      const myIps = new Set<string>();
+      for (const addrs of Object.values(os.networkInterfaces())) {
+        for (const addr of addrs ?? []) {
+          if (addr.family === "IPv4") myIps.add(addr.address);
         }
       }
-    } catch {
-      // Not running in Docker or bridge detection failed — shim/gateway-route fallback will be used
+
+      interface NetworkSummary { Id: string; Name: string; Driver: string; }
+      interface NetworkDetail {
+        Name: string;
+        Containers?: Record<string, { IPv4Address: string }>;
+      }
+
+      const networks = await this.dockerApiGet<NetworkSummary[]>("/networks");
+      for (const net of networks ?? []) {
+        if (net.Driver !== "bridge") continue;
+        const detail = await this.dockerApiGet<NetworkDetail>(`/networks/${net.Id}`);
+        for (const container of Object.values(detail?.Containers ?? {})) {
+          const ip = (container as { IPv4Address: string }).IPv4Address?.split("/")[0];
+          if (ip && myIps.has(ip)) {
+            return { network: net.Name, ip };
+          }
+        }
+      }
+    } catch (e: unknown) {
+      this.console.debug?.(`Bridge network detection failed: ${(e as Error).message}`);
     }
     return null;
+  }
+
+  /**
+   * Returns true when Scrypted's IP is in the same subnet as the macvlan network,
+   * meaning macvlan-to-host kernel isolation will block proxy containers from
+   * reaching it. Covers native installs and Docker with host networking
+   * (--network=host), where Scrypted gets a LAN IP instead of a bridge IP.
+   */
+  private needsMacvlanShim(scryptedIp: string, macvlanIp: string, prefix: number): boolean {
+    const toNum = (ip: string) =>
+      ip.split(".").map(Number).reduce((acc, n) => ((acc << 8) | n) >>> 0, 0) >>> 0;
+    const mask = (~0 << (32 - prefix)) >>> 0;
+    return (toNum(scryptedIp) & mask) === (toNum(macvlanIp) & mask);
+  }
+
+  /**
+   * Create a macvlan shim interface on the host so macvlan proxy containers can
+   * reach Scrypted. When Scrypted runs natively (or with --network=host) its
+   * physical interface IP is unreachable from macvlan containers (the kernel
+   * drops macvlan→host traffic). A shim macvlan interface in bridge mode gives
+   * the host a presence on the macvlan subnet, breaking the isolation.
+   *
+   * The shim IP defaults to subnet base + 2 (overridable). Returns the shim IP
+   * on success, or null if creation failed.
+   */
+  private async ensureMacvlanShim(parentIface: string, ip: string, prefix: number, override?: string): Promise<string | null> {
+    if (this.shimIp !== null) return this.shimIp;
+    // Only attempt creation once: a failed attempt falls through to the
+    // gateway-route strategy permanently instead of spawning a privileged
+    // helper container for every camera.
+    if (this.shimAttempted) return null;
+    this.shimAttempted = true;
+
+    // parentIface is interpolated into a shell command run in a PRIVILEGED,
+    // host-networked helper container, so validate it strictly. prefix must be a
+    // usable subnet (a /31 or /32 leaves no room for a distinct shim address).
+    if (!/^[a-zA-Z0-9._:-]+$/.test(parentIface)) {
+      this.console.error(`Invalid network interface name for macvlan shim: ${parentIface}`);
+      return null;
+    }
+    if (!Number.isInteger(prefix) || prefix < 1 || prefix > 30) {
+      this.console.error(`Macvlan shim needs a subnet prefix between 1 and 30, got ${prefix}`);
+      return null;
+    }
+
+    let shimIp: string;
+    if (override) {
+      shimIp = override;
+    } else {
+      const ipParts = ip.split(".").map(Number);
+      const ipNum = ((ipParts[0] << 24) | (ipParts[1] << 16) | (ipParts[2] << 8) | ipParts[3]) >>> 0;
+      const mask = (~0 << (32 - prefix)) >>> 0;
+      const shimNum = ((ipNum & mask) >>> 0) + 2;
+      shimIp = [
+        (shimNum >>> 24) & 0xff,
+        (shimNum >>> 16) & 0xff,
+        (shimNum >>> 8) & 0xff,
+        shimNum & 0xff,
+      ].join(".");
+    }
+
+    const iface = IpAliasManager.SHIM_IFACE;
+
+    // Existence check via os.networkInterfaces() — no 'ip' binary needed
+    if ((os.networkInterfaces()[iface] ?? []).some(a => a.family === "IPv4" && a.address === shimIp)) {
+      this.console.log(`Macvlan shim ${iface} already up at ${shimIp}`);
+      this.shimIp = shimIp;
+      return shimIp;
+    }
+
+    // Create via a temporary privileged container using the already-pulled
+    // alpine/socat image (busybox includes 'ip'), so this works even when the
+    // Scrypted image lacks iproute2.
+    const cmd = [
+      `ip link del ${iface} 2>/dev/null || true`,
+      `ip link add ${iface} link ${parentIface} type macvlan mode bridge`,
+      `ip addr add ${shimIp}/${prefix} dev ${iface}`,
+      `ip link set ${iface} up`,
+    ].join(" && ");
+
+    try {
+      await this.runPrivilegedCommand(cmd);
+    } catch (e: unknown) {
+      const msg = ((e as Error).message ?? String(e)).split("\n")[0];
+      this.console.error(
+        `Failed to create macvlan shim (${msg}). Run manually on the Scrypted host:\n` +
+        `  ip link add ${iface} link ${parentIface} type macvlan mode bridge && ` +
+        `ip addr add ${shimIp}/${prefix} dev ${iface} && ip link set ${iface} up`,
+      );
+      return null;
+    }
+
+    await new Promise(r => setTimeout(r, 500));
+    if ((os.networkInterfaces()[iface] ?? []).some(a => a.family === "IPv4" && a.address === shimIp)) {
+      this.shimIp = shimIp;
+      this.console.log(
+        `Created macvlan shim ${iface} at ${shimIp}/${prefix} on ${parentIface} — ` +
+        `proxy containers will use this IP to reach Scrypted`,
+      );
+      return shimIp;
+    }
+
+    this.console.error(
+      `Shim command ran but ${iface} not visible with IP ${shimIp} — check permissions or set the shim IP manually.`,
+    );
+    return null;
+  }
+
+  /**
+   * Run a shell command in a temporary privileged container sharing the host
+   * network namespace. Uses alpine/socat (already pulled) whose busybox
+   * includes the 'ip' command.
+   */
+  private async runPrivilegedCommand(cmd: string): Promise<void> {
+    const createResult = await this.dockerApiPost<DockerCreateResponse>("/containers/create", {
+      Image: "alpine/socat:latest",
+      Entrypoint: ["/bin/sh"],
+      Cmd: ["-c", cmd],
+      HostConfig: {
+        NetworkMode: "host",
+        Privileged: true,
+      },
+    });
+
+    if (!createResult?.Id) {
+      throw new Error(`Failed to create privileged helper container: ${JSON.stringify(createResult)}`);
+    }
+
+    const id = createResult.Id;
+    try {
+      await this.dockerApiPost(`/containers/${id}/start`, {});
+
+      const deadline = Date.now() + 15000;
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 300));
+        const info = await this.dockerApiGet<DockerContainerInfo>(`/containers/${id}/json`);
+        if (!info?.State?.Running) {
+          if ((info?.State?.ExitCode ?? 0) !== 0) {
+            throw new Error(`Privileged helper exited with code ${info?.State?.ExitCode}`);
+          }
+          return;
+        }
+      }
+      throw new Error("Privileged helper container timed out after 15 seconds");
+    } finally {
+      await new Promise<void>((resolve) => {
+        // Overall guard: resolve no matter what (even if the daemon stalls
+        // mid-response) so cleanup can never block subsequent addAlias calls.
+        const done = setTimeout(() => resolve(), DOCKER_API_TIMEOUT_MS);
+        done.unref?.();
+        const finish = () => { clearTimeout(done); resolve(); };
+        const req = http.request(
+          { socketPath: DOCKER_SOCKET, path: `/containers/${id}?force=true`, method: "DELETE" },
+          (res) => { res.resume(); res.on("end", finish); res.on("error", finish); },
+        );
+        req.on("error", finish);
+        req.setTimeout(DOCKER_API_TIMEOUT_MS, finish);
+        req.end();
+      });
+    }
+  }
+
+  private async removeShim(): Promise<void> {
+    if (!this.shimIp) return;
+    const iface = IpAliasManager.SHIM_IFACE;
+    try {
+      await this.runPrivilegedCommand(`ip link del ${iface} 2>/dev/null || true`);
+      this.console.log(`Removed macvlan shim ${iface}`);
+    } catch {
+      // Best effort
+    }
+    this.shimIp = null;
   }
 
   /**
@@ -320,8 +347,25 @@ export class IpAliasManager {
   }
 
   private macvlanNetworkName: string | null = null;
-  private macvlanGateway: string | null = null;
+  private networkOwnedByUs = false;
   private static readonly NETWORK_NAME = "onvif_cameras";
+
+  /** Returns true if `ip` falls within `subnet` (e.g. "192.168.1.0/24"). */
+  private static ipInSubnet(ip: string, subnet: string): boolean {
+    const [netStr, prefixStr] = subnet.split("/");
+    const prefix = parseInt(prefixStr, 10);
+    if (!Number.isFinite(prefix) || prefix < 0 || prefix > 32) return false;
+    const toNum = (s: string) => {
+      const p = s.split(".").map(Number);
+      if (p.length !== 4 || p.some((n) => !Number.isFinite(n) || n < 0 || n > 255)) return null;
+      return ((p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]) >>> 0;
+    };
+    const ipNum = toNum(ip);
+    const netNum = toNum(netStr);
+    if (ipNum === null || netNum === null) return false;
+    const mask = prefix === 0 ? 0 : (~0 << (32 - prefix)) >>> 0;
+    return (ipNum & mask) === (netNum & mask);
+  }
 
   /**
    * Serialize access to shared Docker initialization (network + image).
@@ -346,22 +390,62 @@ export class IpAliasManager {
    * This is separate from the Scrypted container's ipvlan network (br0.2),
    * giving each proxy container a unique MAC address.
    */
-  private async ensureMacvlanNetwork(parentIface: string, subnet: string, gateway: string): Promise<boolean> {
+  private async ensureMacvlanNetwork(
+    parentIface: string,
+    subnet: string,
+    gateway: string,
+    ip: string,
+  ): Promise<boolean> {
     if (this.macvlanNetworkName) return true;
 
     const networks = (await this.dockerApiGet<DockerNetwork[]>("/networks")) || [];
     const netSummary = networks.map((n) => `${n.Name}(${n.Driver})`).join(", ");
     this.console.log(`Available Docker networks: ${netSummary}`);
 
-    // Check if our dedicated network already exists
-    const existing = networks.find((n) => n.Name === IpAliasManager.NETWORK_NAME);
-    if (existing) {
+    // 1. Exact-name match — our own network from a prior run
+    const byName = networks.find((n) => n.Name === IpAliasManager.NETWORK_NAME);
+    if (byName) {
       this.macvlanNetworkName = IpAliasManager.NETWORK_NAME;
-      this.console.log(`Using existing ${IpAliasManager.NETWORK_NAME} network (${existing.Driver})`);
+      this.networkOwnedByUs = true;
+      this.console.log(`Using existing ${IpAliasManager.NETWORK_NAME} network (${byName.Driver})`);
       return true;
     }
 
-    // Create a new macvlan network on the specified parent interface
+    // 2. Match by config — any macvlan on the same parent whose subnet contains our IP.
+    // Docker only allows one macvlan per parent interface, so a foreign network on
+    // our parent would block creation anyway. Reuse it when our IP fits.
+    for (const net of networks) {
+      if (net.Driver !== "macvlan") continue;
+      let detail: DockerNetworkDetail | null = null;
+      try {
+        detail = await this.dockerApiGet<DockerNetworkDetail>(`/networks/${net.Id}`);
+      } catch {
+        continue;
+      }
+      if (detail?.Options?.parent !== parentIface) continue;
+
+      const existingSubnet = detail?.IPAM?.Config?.[0]?.Subnet;
+      if (!existingSubnet) continue;
+
+      if (IpAliasManager.ipInSubnet(ip, existingSubnet)) {
+        this.macvlanNetworkName = net.Name;
+        this.networkOwnedByUs = false;
+        this.console.log(
+          `Reusing existing macvlan '${net.Name}' on ${parentIface} (${existingSubnet}) — IP ${ip} fits`,
+        );
+        return true;
+      }
+
+      this.console.error(
+        `Macvlan '${net.Name}' already claims parent ${parentIface} with subnet ${existingSubnet}, ` +
+        `but assigned IP ${ip} is outside it. Either change the plugin's IP range to fall within ` +
+        `${existingSubnet}, or remove '${net.Name}' (docker network rm ${net.Name}) so this plugin ` +
+        `can create its own.`,
+      );
+      return false;
+    }
+
+    // 3. Create our own
     this.console.log(`Creating macvlan network '${IpAliasManager.NETWORK_NAME}' on ${parentIface} (${subnet})...`);
     const result = await this.dockerApiPost<DockerCreateResponse>("/networks/create", {
       Name: IpAliasManager.NETWORK_NAME,
@@ -374,13 +458,15 @@ export class IpAliasManager {
 
     if (result?.Id || result?.id) {
       this.macvlanNetworkName = IpAliasManager.NETWORK_NAME;
+      this.networkOwnedByUs = true;
       this.console.log(`Created macvlan network on ${parentIface} (${subnet})`);
       return true;
     }
 
-    // Handle race condition: another camera already created it
+    // Race condition: another camera created it between our list and create
     if (result?.message?.includes("already exists")) {
       this.macvlanNetworkName = IpAliasManager.NETWORK_NAME;
+      this.networkOwnedByUs = true;
       this.console.log(`Network ${IpAliasManager.NETWORK_NAME} already created by another camera`);
       return true;
     }
@@ -437,29 +523,25 @@ export class IpAliasManager {
       this.macvlanGateway = gateway;
 
       // Ensure macvlan network exists on the specified parent interface
-      const netOk = await this.ensureMacvlanNetwork(parentIface, subnet, gateway);
+      const netOk = await this.ensureMacvlanNetwork(parentIface, subnet, gateway, ip);
       if (!netOk) return false;
 
-      // Fast path: if Scrypted runs in Docker bridge mode, detect its bridge network.
-      // Proxy containers will be connected to that bridge so socat can reach Scrypted
-      // via its bridge IP — no shim or privileged operations needed.
+      // Ensure socat image is available (also used by the shim helper below)
+      await this.ensureSocatImage();
+
+      // Detect once whether Scrypted is reachable via a Docker bridge. macvlan
+      // containers cannot reach the Docker host via its physical IP (kernel
+      // macvlan-to-host isolation); joining the same bridge bypasses that.
       if (this.bridgeConnection === undefined) {
         this.bridgeConnection = await this.findBridgeConnection();
       }
 
-      // When Scrypted's IP is on the same LAN subnet as the macvlan network (native
-      // install or Docker with --network=host), macvlan containers cannot reach it
-      // directly due to kernel macvlan-to-host isolation. Create a shim interface.
-      // Skip this when bridge mode is already handling reachability.
-      if (!this.bridgeConnection) {
-        const hostIpForCheck = this.getContainerIp();
-        if (this.needsMacvlanShim(hostIpForCheck, ip, prefix)) {
-          await this.ensureMacvlanShim(parentIface, ip, prefix, shimIpOverride);
-        }
+      // No bridge (native install or --network=host): if Scrypted's IP is on the
+      // macvlan subnet, create a host shim interface so proxies can reach it.
+      if (!this.bridgeConnection && this.needsMacvlanShim(this.getContainerIp(), ip, prefix)) {
+        await this.ensureMacvlanShim(parentIface, ip, prefix, shimIpOverride);
       }
 
-      // Ensure socat image is available
-      await this.ensureSocatImage();
       return true;
     });
 
@@ -467,29 +549,31 @@ export class IpAliasManager {
 
     // Allocate a unique internal port for the ONVIF server
     const proxyPort = this.allocateProxyPort();
+
+    // Resolve the IP socat inside the proxy must target to reach Scrypted.
+    const bridge = this.bridgeConnection;
     let scryptedIp = this.getContainerIp();
     let needsGatewayRoute = false;
-    if (this.bridgeConnection) {
-      // Docker bridge mode: proxy connects to the bridge and reaches Scrypted via its
-      // bridge IP. Bridge-to-bridge traffic bypasses macvlan-to-host kernel isolation.
-      scryptedIp = this.bridgeConnection.containerIp;
+    if (bridge) {
+      // Docker bridge mode: forward to Scrypted's bridge IP.
+      scryptedIp = bridge.ip;
     } else if (this.needsMacvlanShim(scryptedIp, ip, prefix)) {
       if (this.shimIp) {
-        // Shim created successfully — proxy containers use the shim IP to reach Scrypted
+        // Shim created — proxies reach Scrypted via the shim IP.
         scryptedIp = this.shimIp;
       } else if (this.macvlanGateway) {
-        // Shim unavailable (e.g. VM hypervisor blocks macvlan-to-macvlan traffic).
-        // Add a host-specific route in each proxy container so traffic to Scrypted goes
-        // via the gateway instead of direct ARP, bypassing macvlan-to-host isolation.
+        // Shim unavailable (e.g. VM hypervisor blocks macvlan-to-macvlan): add a
+        // host-specific route inside the proxy so traffic to Scrypted goes via
+        // the gateway instead of direct ARP, bypassing macvlan-to-host isolation.
         needsGatewayRoute = true;
         this.console.log(
-          `Scrypted IP ${scryptedIp} is on the macvlan subnet and shim is unavailable. ` +
-          `Adding gateway route (via ${this.macvlanGateway}) in proxy containers.`,
+          `Scrypted IP ${scryptedIp} is on the macvlan subnet and the shim is unavailable. ` +
+          `Adding a gateway route (via ${this.macvlanGateway}) inside the proxy container.`,
         );
       } else {
         this.console.warn(
-          `Scrypted IP ${scryptedIp} is on the macvlan subnet — shim creation failed. ` +
-          `Falling back to host IP. ONVIF adoption may fail.`,
+          `Scrypted IP ${scryptedIp} is on the macvlan subnet but no shim or gateway is available. ` +
+          `Falling back to host IP for socat forwarding — ONVIF adoption may fail.`,
         );
       }
     }
@@ -497,7 +581,6 @@ export class IpAliasManager {
     // Remove existing proxy container if any
     await this.removeProxyContainer(containerName);
 
-    // Build socat command: always proxy ONVIF (8000), optionally proxy RTSP (554+)
     // Validate hostnames/ports to prevent shell injection
     const sanitizeHost = (h: string) => {
       if (!/^[a-zA-Z0-9._-]+$/.test(h)) throw new Error(`Invalid hostname: ${h}`);
@@ -508,29 +591,45 @@ export class IpAliasManager {
       return p;
     };
 
-    // When using the gateway route fallback, prefix the sh command with the route setup.
-    // busybox 'ip' is available in alpine/socat; '|| true' makes it idempotent on restart.
+    // When using the gateway-route fallback, prefix the sh command with the route
+    // setup. busybox 'ip' is available in alpine/socat; '|| true' keeps it
+    // idempotent across container restarts.
     const routePrefix = needsGatewayRoute && this.macvlanGateway
       ? `ip route add ${sanitizeHost(scryptedIp)}/32 via ${sanitizeHost(this.macvlanGateway)} 2>/dev/null || true && `
-      : '';
+      : "";
 
+    // Build socat command: always proxy ONVIF (8000), optionally proxy RTSP (554+).
+    // RTSP streams live on the same Scrypted host as ONVIF, so they are forwarded
+    // to scryptedIp (bridge/shim) too — the original target.host (Scrypted's
+    // physical IP) is unreachable from macvlan containers.
     let cmd: string[];
     const entrypoint = ["/bin/sh"];
     if (rtspTargets && rtspTargets.length > 0) {
-      // Run multiple socat instances: ONVIF + one per RTSP stream
       const socatCmds = [`socat TCP-LISTEN:8000,fork,reuseaddr TCP:${sanitizeHost(scryptedIp)}:${sanitizePort(proxyPort)}`];
-      const proxyListenPorts = rtspTargets.map((_, idx) => 554 + idx);
-      const fallbackRtspPort = rtspTargets.find((target) => !proxyListenPorts.includes(target.port))?.port;
       rtspTargets.forEach((target, idx) => {
         const listenPort = 554 + idx;
-        const targetPort = proxyListenPorts.includes(target.port) && fallbackRtspPort
-          ? fallbackRtspPort
-          : target.port;
-        if (targetPort !== target.port) {
-          this.console.warn(
-            `RTSP target ${target.host}:${target.port} looks like a proxy listener. ` +
-            `Forwarding ${listenPort} to Scrypted rebroadcast port ${targetPort} instead.`,
-          );
+        // Guard against a refreshed RTSP target whose port already equals this
+        // proxy's own listener port (554+idx) — forwarding it to scryptedIp on
+        // the same port would point the proxy at a dead/wrong endpoint. Borrow a
+        // sibling target's real rebroadcast port when one is available.
+        let targetPort = target.port;
+        if (target.port === listenPort) {
+          const realPort = rtspTargets.find(
+            (t, i) => i !== idx && t.port !== 554 + i,
+          )?.port;
+          if (realPort) {
+            this.console.warn(
+              `RTSP target ${target.host}:${target.port} matches this proxy's listener port. ` +
+              `Forwarding ${listenPort} to Scrypted rebroadcast port ${realPort} instead.`,
+            );
+            targetPort = realPort;
+          } else {
+            this.console.warn(
+              `RTSP target ${target.host}:${target.port} matches this proxy's listener port ` +
+              `and no alternative rebroadcast port is known — playback for this stream may fail. ` +
+              `Refresh streams after the proxy is up to pick up the real rebroadcast URL.`,
+            );
+          }
         }
         socatCmds.push(`socat TCP-LISTEN:${sanitizePort(listenPort)},fork,reuseaddr TCP:${sanitizeHost(scryptedIp)}:${sanitizePort(targetPort)}`);
       });
@@ -539,7 +638,13 @@ export class IpAliasManager {
       cmd = ["-c", `${routePrefix}socat TCP-LISTEN:8000,fork,reuseaddr TCP:${sanitizeHost(scryptedIp)}:${sanitizePort(proxyPort)}`];
     }
 
-    // Create proxy container on our dedicated macvlan network with unique MAC
+    // Create proxy container on our dedicated macvlan network with unique MAC.
+    // The MAC must be set on the network endpoint (NetworkingConfig.EndpointsConfig):
+    // the top-level MacAddress field was deprecated in Docker API v1.44 (Docker 25)
+    // and is ignored for non-default networks attached this way, so newer Docker
+    // assigns a random MAC each time the container is recreated (UniFi Protect then
+    // sees a "new" camera). We keep the top-level value for older Docker daemons that
+    // predate per-endpoint MacAddress support.
     const containerConfig = {
       Image: "alpine/socat:latest",
       Entrypoint: entrypoint,
@@ -548,13 +653,14 @@ export class IpAliasManager {
       HostConfig: {
         RestartPolicy: { Name: "unless-stopped" },
         NetworkMode: this.macvlanNetworkName!,
-        // NET_ADMIN required when adding a host-specific route at container startup
+        // NET_ADMIN is required to add the host-specific route at container startup
         ...(needsGatewayRoute ? { CapAdd: ["NET_ADMIN"] } : {}),
       },
       NetworkingConfig: {
         EndpointsConfig: {
           [this.macvlanNetworkName!]: {
             IPAMConfig: { IPv4Address: ip },
+            MacAddress: mac,
           },
         },
       },
@@ -578,17 +684,14 @@ export class IpAliasManager {
       return { ok: false };
     }
 
-    // Connect to Scrypted's bridge network so socat can reach its bridge IP
-    if (this.bridgeConnection) {
+    // Connect the proxy container to Scrypted's bridge network so socat can reach
+    // Scrypted via the bridge IP (macvlan containers cannot reach the host physical IP).
+    if (bridge) {
       try {
-        await this.dockerApiPost(`/networks/${this.bridgeConnection.networkId}/connect`, {
-          Container: createResult.Id,
-        });
+        await this.dockerApiPost(`/networks/${bridge.network}/connect`, { Container: createResult.Id });
+        this.console.log(`Proxy container connected to bridge network '${bridge.network}' → socat target ${bridge.ip}:${proxyPort}`);
       } catch (e: unknown) {
-        this.console.warn(
-          `Failed to connect proxy to bridge '${this.bridgeConnection.networkName}': ${(e as Error).message}. ` +
-          `ONVIF forwarding may fail.`,
-        );
+        this.console.warn(`Could not connect proxy to bridge network '${bridge.network}': ${(e as Error).message}`);
       }
     }
 
