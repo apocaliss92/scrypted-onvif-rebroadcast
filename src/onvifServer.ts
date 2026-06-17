@@ -1103,14 +1103,23 @@ export class OnvifServer {
     return this.getPtzNodes();
   }
 
+  // Parse a PanTilt vector's x/y attributes (velocity for ContinuousMove, position for AbsoluteMove)
+  private parsePanTilt(body: string): { x: number; y: number } {
+    const xm = body.match(/PanTilt[^>]*\bx="(-?[0-9.eE]+)"/i);
+    const ym = body.match(/PanTilt[^>]*\by="(-?[0-9.eE]+)"/i);
+    return { x: xm ? parseFloat(xm[1]) : 0, y: ym ? parseFloat(ym[1]) : 0 };
+  }
+
   private ptzContinuousMove(body: string): string {
     if (!this.config.capabilities.hasPtz) {
       return this.soapFault("Sender", "PTZ not supported");
     }
-    // Log the PTZ command — actual movement is handled by the Scrypted device
+    const { x, y } = this.parsePanTilt(body);
     this.console.log(
-      `PTZ ContinuousMove request for ${this.config.deviceName}`,
+      `PTZ ContinuousMove (${x}, ${y}) for ${this.config.deviceName}`,
     );
+    // ONVIF ContinuousMove velocity (-1..1) maps to a Scrypted continuous PTZ command.
+    this.config.ptzCommand?.({ movement: "Continuous", pan: x, tilt: y });
     return soapEnvelope(`<tptz:ContinuousMoveResponse/>`);
   }
 
@@ -1118,7 +1127,9 @@ export class OnvifServer {
     if (!this.config.capabilities.hasPtz) {
       return this.soapFault("Sender", "PTZ not supported");
     }
-    this.console.log(`PTZ AbsoluteMove request for ${this.config.deviceName}`);
+    const { x, y } = this.parsePanTilt(body);
+    this.console.log(`PTZ AbsoluteMove (${x}, ${y}) for ${this.config.deviceName}`);
+    this.config.ptzCommand?.({ movement: "Absolute", pan: x, tilt: y });
     return soapEnvelope(`<tptz:AbsoluteMoveResponse/>`);
   }
 
@@ -1135,6 +1146,8 @@ export class OnvifServer {
       return this.soapFault("Sender", "PTZ not supported");
     }
     this.console.log(`PTZ Stop request for ${this.config.deviceName}`);
+    // Zero velocity stops the move (Scrypted maps this to the camera's stop).
+    this.config.ptzCommand?.({ movement: "Continuous", pan: 0, tilt: 0 });
     return soapEnvelope(`<tptz:StopResponse/>`);
   }
 

@@ -668,6 +668,14 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
           "image/jpeg",
         );
       },
+      ptzCommand: (command) => {
+        try {
+          const cam = systemManager.getDeviceById(this.id) as any;
+          cam?.ptzCommand?.(command);
+        } catch (e) {
+          this.console.error("PTZ forward error", e);
+        }
+      },
     };
 
     this.onvifServer = new OnvifServer(this.console, config);

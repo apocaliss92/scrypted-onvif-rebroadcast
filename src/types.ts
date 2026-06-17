@@ -49,4 +49,6 @@ export interface OnvifServiceConfig {
     capabilities: DeviceCapabilities;
     /** Callback to get a JPEG snapshot from the camera */
     getSnapshot?: () => Promise<Buffer>;
+    /** Callback to forward a PTZ command to the camera (Scrypted PanTiltZoomCommand). */
+    ptzCommand?: (command: { movement?: string; pan?: number; tilt?: number; speed?: number }) => void;
 }
