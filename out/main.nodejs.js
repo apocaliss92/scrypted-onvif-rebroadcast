@@ -5513,7 +5513,7 @@ class OnvifRebroadcastPlugin extends sdk_1.ScryptedDeviceBase {
             },
             autoIpEnabled: {
                 title: "Auto-assign unique IPs",
-                description: "Automatically create a virtual IP alias for each camera so NVRs like UniFi can discover them as separate devices. Requires NET_ADMIN capability (Docker) or root (bare metal).",
+                description: "Automatically create a Docker macvlan proxy container for each camera so NVRs like UniFi can discover them as separate devices. Requires access to the Docker socket. Native / host-networked installs may also need a macvlan shim.",
                 type: "boolean",
                 defaultValue: false,
                 group: "IP Allocation",

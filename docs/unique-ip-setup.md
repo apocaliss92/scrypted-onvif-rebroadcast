@@ -4,9 +4,9 @@ UniFi Protect identifies third-party ONVIF cameras by **MAC address**. When mult
 
 ## Prerequisites
 
-- Scrypted running in Docker with the **Rebroadcast** plugin installed
-- Docker socket mounted in the Scrypted container (`/var/run/docker.sock`)
-- A network bridge interface available for macvlan (e.g. `br0`)
+- The **Rebroadcast** plugin installed in Scrypted
+- Docker installed and the Docker socket accessible at `/var/run/docker.sock`
+- A parent network interface available for macvlan (e.g. `eth0`, `ens3`, `br0`)
 
 ## How It Works
 
@@ -17,16 +17,20 @@ The plugin creates a **Docker macvlan network** and spawns a lightweight **proxy
 - TCP proxies for **ONVIF** (port 8000) and **RTSP** (port 554+) traffic
 
 ```
-UniFi Protect                Docker macvlan proxy              Scrypted container
-(your LAN)                   (unique IP + MAC)                 (internal IP)
+UniFi Protect                Docker macvlan proxy              Scrypted
+(your LAN)                   (unique IP + MAC)                 (bridge or shim IP)
      │                              │                                │
      │── ONVIF (port 8000) ───────▶│── TCP proxy ─────────────────▶│  ONVIF server
      │── RTSP  (port 554)  ───────▶│── TCP proxy ─────────────────▶│  RTSP rebroadcast
 ```
 
-## Step 1: Mount Docker Socket
+## Step 1: Provide Docker Access
 
-The plugin needs access to Docker to create proxy containers. Add this path mapping to your Scrypted container:
+The plugin needs Docker access to create macvlan networks and proxy containers.
+
+### Docker bridge networking
+
+Bridge networking is the preferred setup. Mount the Docker socket into Scrypted:
 
 | Container Path | Host Path |
 |---|---|
@@ -46,6 +50,20 @@ volumes:
 docker run ... -v /var/run/docker.sock:/var/run/docker.sock ...
 ```
 
+The plugin detects Scrypted's Docker bridge network and connects each proxy container to it, so no host-side macvlan shim is needed.
+
+### Docker host networking or native install
+
+If Scrypted runs with `--network=host` or directly on the host, Scrypted's IP is usually on the same LAN subnet as the macvlan proxy IPs. Linux macvlan isolation prevents proxy containers from reaching that host IP directly.
+
+In that case, the plugin attempts to create a host-side `macvlan-shim0` interface through a temporary privileged helper container. If your Docker setup does not allow that, create the shim manually on the host:
+
+```bash
+ip link add macvlan-shim0 link <parent-iface> type macvlan mode bridge
+ip addr add <shim-ip>/<prefix> dev macvlan-shim0
+ip link set macvlan-shim0 up
+```
+
 ## Step 2: Configure Plugin Settings
 
 Open the ONVIF Rebroadcast plugin settings in Scrypted and configure the **IP Allocation** section:
@@ -57,6 +75,7 @@ Open the ONVIF Rebroadcast plugin settings in Scrypted and configure the **IP Al
 | **Network interface** | Parent interface for the macvlan Docker network | `br0` |
 | **Subnet prefix length** | CIDR prefix matching your network | `23` or `24` |
 | **Gateway** | Your network's default gateway | `192.168.1.1` |
+| **Macvlan shim IP** | Optional shim address for native / host networking. Leave empty to auto-assign. Ignored in Docker bridge mode. | `192.168.1.2` |
 
 ### Choosing the Right IP Range
 
@@ -101,6 +120,19 @@ Each camera should show its assigned IP and MAC.
 Repeat for each camera IP. Each will be recognized as a separate device with its own unique MAC.
 
 > **Note:** UniFi will display the camera's actual model number (e.g. "Reolink CX410") as reported by the ONVIF device information.
+
+## UniFi Protect Audio
+
+The proxy only forwards Scrypted's RTSP rebroadcast stream. It cannot add or transcode audio after the fact.
+
+If UniFi Protect shows video but no audio:
+
+- In Scrypted's Rebroadcast settings, try the available stream modes and keep the one that exposes stable audio in Protect. Some cameras work better with default rebroadcast audio than Improved Compatibility Mode.
+- In the ONVIF Rebroadcast mixin settings, click **Refresh streams**.
+- Select the working main/sub streams under **Streams to expose via ONVIF**.
+- Remove and re-add the camera in UniFi Protect so Protect re-reads the ONVIF profile and RTSP audio metadata.
+
+Check the ONVIF Rebroadcast logs after refresh. The selected streams should show audio metadata so you can compare which mode Protect handles best.
 
 ## Step 5: Verify
 
