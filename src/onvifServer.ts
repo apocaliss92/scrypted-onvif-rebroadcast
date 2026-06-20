@@ -54,6 +54,8 @@ export class OnvifServer {
   private digestNonces: Map<string, number> = new Map(); // nonce → expiry timestamp
   private subscriptionCleanupTimer: ReturnType<typeof setInterval> | null = null;
   private lastSnapshotTime: number = 0;
+  private loggedAuthOk = false; // diagnostic: log the first successful auth only (issue #15)
+  private loggedFirstRequest = false; // diagnostic: log the first inbound request only (issue #15)
 
   constructor(console: Console, config: OnvifServiceConfig) {
     this.console = console;
@@ -190,6 +192,18 @@ export class OnvifServer {
   private handleRequest(req: http.IncomingMessage, res: http.ServerResponse) {
     const url = req.url ?? "/";
 
+    // Diagnostic (issue #15): log the first request reaching this server so logs
+    // confirm the client/proxy can actually reach the ONVIF server. If this line
+    // never appears for a virtual-IP camera, the problem is the network/proxy path
+    // (e.g. macvlan host-fallback), not authentication.
+    if (!this.loggedFirstRequest) {
+      this.loggedFirstRequest = true;
+      this.console.log(
+        `[request] First request reached ONVIF server for ${this.config.deviceName} ` +
+        `from ${req.socket.remoteAddress ?? "?"} (${req.method} ${url}).`,
+      );
+    }
+
     // Handle snapshot requests (non-SOAP, plain HTTP GET)
     if (req.method === "GET" && url.startsWith("/snapshot")) {
       // Authenticate snapshot requests via HTTP Digest/Basic
@@ -255,6 +269,18 @@ export class OnvifServer {
     res.end("Unauthorized");
   }
 
+  /**
+   * Diagnostic (issue #15): log the first successful authentication so the logs
+   * confirm the client reached the ONVIF server AND credentials were accepted —
+   * distinguishing a network/proxy problem from an auth problem. Logged once to
+   * avoid spamming every subsequent request.
+   */
+  private logAuthOk(method: string): void {
+    if (this.loggedAuthOk) return;
+    this.loggedAuthOk = true;
+    this.console.log(`[auth] First successful authentication for ${this.config.deviceName} via ${method}.`);
+  }
+
   /** Timing-safe string comparison to prevent credential brute-force via timing side-channel */
   private safeEqual(a: string, b: string): boolean {
     if (a.length !== b.length) return false;
@@ -273,7 +299,14 @@ export class OnvifServer {
       if (colonIdx < 0) return false;
       const httpUser = decoded.slice(0, colonIdx);
       const httpPass = decoded.slice(colonIdx + 1);
-      return this.safeEqual(httpUser, username) && this.safeEqual(httpPass, password ?? "");
+      const ok = this.safeEqual(httpUser, username) && this.safeEqual(httpPass, password ?? "");
+      if (!ok) {
+        this.console.warn(
+          `[auth] HTTP Basic auth failed for ${this.config.deviceName}: ` +
+          `${this.safeEqual(httpUser, username) ? "wrong password" : `username mismatch (client sent "${httpUser}", expected "${username}")`}.`,
+        );
+      }
+      return ok;
     }
 
     if (authHeader.startsWith("Digest ")) {
@@ -295,13 +328,25 @@ export class OnvifServer {
       params[match[1]] = match[2] ?? match[3];
     }
 
-    if (!this.safeEqual(params.username ?? "", username)) return false;
+    if (!this.safeEqual(params.username ?? "", username)) {
+      this.console.warn(
+        `[auth] Digest username mismatch for ${this.config.deviceName}: client sent "${params.username ?? ""}", expected "${username}".`,
+      );
+      return false;
+    }
 
     // Verify nonce is valid
     const nonce = params.nonce;
-    if (!nonce || !this.digestNonces.has(nonce)) return false;
+    if (!nonce || !this.digestNonces.has(nonce)) {
+      this.console.warn(
+        `[auth] Digest nonce unknown/missing for ${this.config.deviceName} ` +
+        `(client may be reusing a nonce we already consumed — re-challenging). nc=${params.nc ?? "?"}`,
+      );
+      return false;
+    }
     if (this.digestNonces.get(nonce)! < Date.now()) {
       this.digestNonces.delete(nonce);
+      this.console.warn(`[auth] Digest nonce expired for ${this.config.deviceName} — re-challenging.`);
       return false;
     }
 
@@ -323,6 +368,12 @@ export class OnvifServer {
     }
 
     const valid = this.safeEqual(params.response ?? "", expected);
+    if (!valid) {
+      this.console.warn(
+        `[auth] Digest response mismatch for ${this.config.deviceName} ` +
+        `(username ok, nonce ok — wrong password or realm/uri mismatch). realm="${realm}", uri="${uri}", qop="${qop ?? "none"}".`,
+      );
+    }
     // Invalidate nonce after use to prevent replay attacks
     if (valid) this.digestNonces.delete(nonce);
     return valid;
@@ -446,6 +497,9 @@ export class OnvifServer {
     const wsUsername = this.extractValue(body, "Username");
     if (wsUsername) {
       if (!this.safeEqual(wsUsername, username)) {
+        this.console.warn(
+          `[auth] WS-Security username mismatch for ${this.config.deviceName}: client sent "${wsUsername}", expected "${username}".`,
+        );
         return this.soapFault("Sender", "Not authorized");
       }
 
@@ -463,26 +517,38 @@ export class OnvifServer {
         const expectedDigest = hash.digest("base64");
 
         if (this.safeEqual(wsPassword, expectedDigest)) {
+          this.logAuthOk("WS-Security PasswordDigest");
           return null;
         }
       }
 
       // Plaintext password comparison (some ONVIF clients send PasswordText type)
       if (password && wsPassword && this.safeEqual(wsPassword, password)) {
+        this.logAuthOk("WS-Security PasswordText");
         return null;
       }
 
+      this.console.warn(
+        `[auth] WS-Security password mismatch for ${this.config.deviceName} ` +
+        `(username ok). type=${wsNonce && wsCreated ? "PasswordDigest" : "PasswordText"}, ` +
+        `hasNonce=${!!wsNonce}, hasCreated=${!!wsCreated} — check the password configured in the plugin.`,
+      );
       return this.soapFault("Sender", "Not authorized");
     }
 
     // 2. Try HTTP auth headers (Basic or Digest)
     if (req && this.validateHttpAuth(req)) {
+      this.logAuthOk("HTTP " + String(req.headers["authorization"]).split(" ")[0]);
       return null;
     }
 
     const authHeader = req?.headers?.["authorization"];
     if (authHeader) {
       // Auth header present but validation failed
+      this.console.warn(
+        `[auth] HTTP auth header present but rejected for ${this.config.deviceName} ` +
+        `(scheme=${authHeader.split(" ")[0]}). See the [auth] Digest/Basic lines above for the reason.`,
+      );
       return this.soapFault("Sender", "Not authorized");
     }
 

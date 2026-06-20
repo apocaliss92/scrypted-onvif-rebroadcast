@@ -560,36 +560,69 @@ export class IpAliasManager {
 
     // Resolve the IP socat inside the proxy must target to reach Scrypted.
     const bridge = this.bridgeConnection;
-    let scryptedIp = this.getContainerIp();
+    const hostIp = this.getContainerIp();
+    let scryptedIp = hostIp;
     let needsGatewayRoute = false;
+    // Diagnostic: which path resolved the socat forwarding target. Surfaces the
+    // root cause of "credentials rejected only on virtual IP" (issue #15): when
+    // the target resolves to "host-fallback" the proxy cannot reach Scrypted and
+    // ONVIF adoption/auth fails. Shared via logs to confirm the network path.
+    let forwardMode:
+      | "shim-override"
+      | "bridge"
+      | "shim"
+      | "gateway-route"
+      | "host-fallback"
+      | "direct" = "direct";
     if (shimIpOverride) {
       // Explicit host/shim IP override: the user tells us exactly where Scrypted
       // is reachable from the macvlan subnet (e.g. a shim interface they manage).
       // Trust it as the socat target directly, regardless of bridge/shim probing.
       scryptedIp = shimIpOverride;
+      forwardMode = "shim-override";
       this.console.log(`Using configured Macvlan shim IP ${scryptedIp} as the socat forwarding target.`);
     } else if (bridge) {
       // Docker bridge mode: forward to Scrypted's bridge IP.
       scryptedIp = bridge.ip;
+      forwardMode = "bridge";
     } else if (this.needsMacvlanShim(scryptedIp, ip, prefix)) {
       if (this.shimIp) {
         // Shim created — proxies reach Scrypted via the shim IP.
         scryptedIp = this.shimIp;
+        forwardMode = "shim";
       } else if (this.macvlanGateway) {
         // Shim unavailable (e.g. VM hypervisor blocks macvlan-to-macvlan): add a
         // host-specific route inside the proxy so traffic to Scrypted goes via
         // the gateway instead of direct ARP, bypassing macvlan-to-host isolation.
         needsGatewayRoute = true;
+        forwardMode = "gateway-route";
         this.console.log(
           `Scrypted IP ${scryptedIp} is on the macvlan subnet and the shim is unavailable. ` +
           `Adding a gateway route (via ${this.macvlanGateway}) inside the proxy container.`,
         );
       } else {
+        forwardMode = "host-fallback";
         this.console.warn(
           `Scrypted IP ${scryptedIp} is on the macvlan subnet but no shim or gateway is available. ` +
           `Falling back to host IP for socat forwarding — ONVIF adoption may fail.`,
         );
       }
+    }
+
+    // Diagnostic summary of the resolved forwarding path (issue #15). On Proxmox
+    // LXC / native installs a "host-fallback" or unreachable target is the prime
+    // suspect for ONVIF credentials being rejected only on the virtual IP.
+    this.console.log(
+      `[forwarding] camera ${deviceId}: virtualIP ${ip}:8000 → socat target ${scryptedIp}:${proxyPort} ` +
+      `(mode=${forwardMode}, hostIP=${hostIp}, bridge=${bridge ? bridge.ip : "none"}, ` +
+      `shimIP=${this.shimIp ?? "none"}, gateway=${this.macvlanGateway ?? "none"})`,
+    );
+    if (forwardMode === "host-fallback") {
+      this.console.warn(
+        `[forwarding] camera ${deviceId}: using host-fallback target ${scryptedIp} — the proxy likely ` +
+        `cannot reach Scrypted from the macvlan subnet. Set "Macvlan shim IP" to a reachable host/shim ` +
+        `address to fix ONVIF adoption (see issue #15).`,
+      );
     }
 
     // Remove existing proxy container if any
