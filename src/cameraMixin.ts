@@ -377,12 +377,14 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
               this.console.log(
                 `${this.name}: detected resolution from snapshot: ${res.width}x${res.height}`,
               );
-              // Apply to all streams that lack resolution (main gets full res, others assumed same)
-              for (const s of this.discoveredStreams) {
-                if (!s.width) {
-                  s.width = res.width;
-                  s.height = res.height;
-                }
+              // Apply only to the stream the snapshot actually reflects (the
+              // primary/main stream). A snapshot corresponds to exactly one
+              // stream, so backfilling every stream that lacks resolution
+              // would falsely advertise sub-streams as having the same
+              // resolution as main.
+              if (!this.discoveredStreams[0].width) {
+                this.discoveredStreams[0].width = res.width;
+                this.discoveredStreams[0].height = res.height;
               }
             }
           }
