@@ -49,6 +49,52 @@ interface DockerNetworkDetail {
   };
 }
 
+/**
+ * Strict IPv4 literal validation for values interpolated into shell commands
+ * run inside a privileged container. Deliberately tighter than a generic
+ * hostname check — nothing but four dotted octets is accepted.
+ */
+export function assertIpv4Literal(ip: string): string {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(ip);
+  if (!m || m.slice(1).some((o) => Number(o) > 255)) {
+    throw new Error(`Invalid IPv4 address: ${ip}`);
+  }
+  return ip;
+}
+
+/** Linux interface names: letters, digits, dot, dash, underscore, max 15 chars. */
+export function assertInterfaceName(iface: string): string {
+  if (!/^[a-zA-Z0-9._-]{1,15}$/.test(iface)) {
+    throw new Error(`Invalid interface name: ${iface}`);
+  }
+  return iface;
+}
+
+/**
+ * Build the host route command that makes a virtual camera IP reachable
+ * through the macvlan shim.
+ *
+ * `ip addr add <shimIp>/<prefix> dev <shim>` already creates a connected route
+ * for the whole subnet, but the host has an identical one on the physical
+ * interface and that one wins. Traffic to a camera's virtual IP therefore
+ * leaves via the physical NIC — and a macvlan parent interface cannot reach
+ * its own macvlan children, so the connection dies with an empty reply.
+ *
+ * A /32 is more specific than the /24, so it takes precedence and the traffic
+ * goes through the shim, which *can* reach the children.
+ */
+export function buildVirtualIpRouteCommand(
+  ip: string,
+  iface: string,
+  action: "add" | "remove",
+): string {
+  const safeIp = assertIpv4Literal(ip);
+  const safeIface = assertInterfaceName(iface);
+  return action === "add"
+    ? `ip route replace ${safeIp}/32 dev ${safeIface}`
+    : `ip route del ${safeIp}/32 dev ${safeIface} 2>/dev/null || true`;
+}
+
 export class IpAliasManager {
   private console: Console;
   private activeProxies: Map<string, { ip: string; mac: string; containerId: string; proxyPort: number }> = new Map();
@@ -275,6 +321,63 @@ export class IpAliasManager {
       `Shim command ran but ${iface} not visible with IP ${shimIp} — check permissions or set the shim IP manually.`,
     );
     return null;
+  }
+
+  /**
+   * Find the interface that currently holds the shim IP.
+   *
+   * Resolved at runtime rather than assuming {@link SHIM_IFACE}, because
+   * `ensureMacvlanShim()` deliberately reuses a shim the user created manually
+   * under a different name — in that case we know the IP but not the name.
+   */
+  private resolveShimInterface(): string | null {
+    if (!this.shimIp) return null;
+    for (const [name, addrs] of Object.entries(os.networkInterfaces())) {
+      if ((addrs ?? []).some((a) => a.family === "IPv4" && a.address === this.shimIp)) {
+        return name;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Add or remove the host route that makes a camera's virtual IP reachable
+   * through the macvlan shim.
+   *
+   * Without it the host resolves the virtual IP through the physical NIC,
+   * which cannot talk to its own macvlan children — the ONVIF endpoint then
+   * answers with an empty reply and UniFi Protect adoption fails with what
+   * looks like a credentials error. See issue #15, where the missing routes
+   * were first identified by a user adding them by hand.
+   *
+   * Best-effort: a failure here is logged with the manual command but never
+   * blocks proxy setup, since the route is unnecessary in bridge mode and on
+   * hosts that route the subnet differently.
+   */
+  private async syncVirtualIpHostRoute(ip: string, action: "add" | "remove"): Promise<void> {
+    if (!this.shimIp) return; // Only meaningful in shim mode.
+    const iface = this.resolveShimInterface();
+    if (!iface) {
+      this.console.warn(
+        `Could not find the interface holding shim IP ${this.shimIp} — skipping host route for ${ip}. ` +
+        `If ONVIF adoption fails, add it manually: ip route replace ${ip}/32 dev ${IpAliasManager.SHIM_IFACE}`,
+      );
+      return;
+    }
+
+    const cmd = buildVirtualIpRouteCommand(ip, iface, action);
+    try {
+      await this.runPrivilegedCommand(cmd);
+      if (action === "add") {
+        this.console.log(`[forwarding] host route ${ip}/32 → ${iface} (virtual IP reachable through the macvlan shim)`);
+      }
+    } catch (e: unknown) {
+      const msg = ((e as Error).message ?? String(e)).split("\n")[0];
+      this.console.warn(
+        `Could not ${action} host route for virtual IP ${ip} (${msg}). ` +
+        `If UniFi Protect refuses the credentials, run this on the Scrypted host:\n  ${cmd}`,
+      );
+    }
   }
 
   /**
@@ -753,6 +856,10 @@ export class IpAliasManager {
         this.console.log(
           `Proxy container ${containerName}: IP=${actualIp} MAC=${actualMac} → ${scryptedIp}:${proxyPort}`,
         );
+        // In shim mode the host needs a /32 route or it reaches this virtual IP
+        // through the physical NIC, which cannot talk to its own macvlan
+        // children. Best-effort — never fails proxy setup.
+        await this.syncVirtualIpHostRoute(actualIp, "add");
         return { ok: true, proxyPort };
       }
       const exitCode = info?.State?.ExitCode;
@@ -847,6 +954,7 @@ export class IpAliasManager {
     if (!proxy) return;
     const containerName = IpAliasManager.sanitizeContainerName(`onvif-proxy-${deviceId}`);
     await this.removeProxyContainer(containerName);
+    await this.syncVirtualIpHostRoute(proxy.ip, "remove");
     this.activeProxies.delete(deviceId);
     this.console.log(`Removed proxy container for ${proxy.ip}`);
   }
