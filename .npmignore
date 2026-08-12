@@ -3,6 +3,7 @@ out/
 node_modules/
 *.map
 src
+test/
 .vscode
 dist/*.js
 .venv
