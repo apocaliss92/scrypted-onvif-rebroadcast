@@ -539,6 +539,10 @@ export class OnvifRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
       streamsToExpose = this.discoveredStreams.slice(0, 2);
     }
 
+    // Proxy URL rewriting must not mutate the cached discovery results. Server
+    // restarts and profile changes reuse that cache to select backend targets.
+    streamsToExpose = streamsToExpose.map((stream) => ({ ...stream }));
+
     // Log what we're about to expose. Since this plugin only wraps RTSP in ONVIF
     // (no transcoding), the output codecs are identical to the input — the log
     // makes that explicit so users can verify their synthetic-stream choice.
